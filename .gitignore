@@ -1,0 +1,15 @@
+# Secrets & local state (never commit these)
+.env
+*serviceAccountKey*.json
+firebase_key.json
+local_mock_db.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/settings.json
