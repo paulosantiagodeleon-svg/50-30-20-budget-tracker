@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
@@ -52,6 +52,16 @@ def _iso_date(value: Any, name: str) -> str:
         raise ValidationError(f"{name} must be a valid date (YYYY-MM-DD).") from None
 
 
+def _due_day(value: Any, name: str = "Due day") -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{name} must be a whole number from 1 to 31.") from None
+    if not number.is_integer() or not 1 <= number <= 31:
+        raise ValidationError(f"{name} must be a whole number from 1 to 31.")
+    return int(number)
+
+
 def _text(value: Any, name: str, *, required: bool = True) -> str:
     text = "" if value is None else str(value).strip()
     if required and not text:
@@ -88,6 +98,7 @@ class IncomeCycle(_Document):
     start_date: str
     end_date: str
     is_active: bool = True
+    top_ups: list = field(default_factory=list)  # history of mid-cycle salary top-ups (v1.1)
 
     def __post_init__(self) -> None:
         self.cycle_name = _text(self.cycle_name, "Cycle name")
@@ -100,6 +111,9 @@ class IncomeCycle(_Document):
         if self.end_date < self.start_date:
             raise ValidationError("End date cannot be before the start date.")
         self.is_active = bool(self.is_active)
+        if not isinstance(self.top_ups, list):
+            raise ValidationError("Top-ups must be a list.")
+        self.top_ups = [dict(entry) for entry in self.top_ups]
 
 
 @dataclass
@@ -166,3 +180,34 @@ class SavingsAccount(_Document):
         if rate > 100:
             raise ValidationError("Interest rate must be between 0 and 100 (%).")
         self.interest_rate = rate
+
+
+@dataclass
+class RecurringTemplate(_Document):
+    """A bill/subscription/auto-save that can be posted into the active cycle in one click."""
+
+    id: str
+    name: str
+    amount: float
+    category: str
+    bucket: str
+    payment_channel: str
+    target_account_id: Optional[str] = None
+    due_day: int = 1  # day of month (1-31); short months clamp to their last day
+
+    def __post_init__(self) -> None:
+        self.name = _text(self.name, "Bill name")
+        self.amount = _money(self.amount, "Amount", positive=True)
+        self.category = _text(self.category, "Category")
+        if self.bucket not in LOG_BUCKETS:
+            raise ValidationError(f"Bucket must be one of: {', '.join(LOG_BUCKETS)}.")
+        self.payment_channel = _text(self.payment_channel, "Payment channel")
+        target = _text(self.target_account_id, "Target account", required=False)
+        if self.bucket in LINKED_BUCKETS:
+            if not target:
+                label = "savings account" if self.bucket == "Savings" else "debt"
+                raise ValidationError(f"Select a {label} for a {self.bucket} bill.")
+            self.target_account_id = target
+        else:
+            self.target_account_id = None
+        self.due_day = _due_day(self.due_day)

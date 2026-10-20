@@ -25,7 +25,8 @@ INCOME_CYCLES = "income_cycles"
 TRANSACTIONS = "transactions"
 DEBTS = "debts"
 SAVINGS_ACCOUNTS = "savings_accounts"
-COLLECTIONS = (INCOME_CYCLES, TRANSACTIONS, DEBTS, SAVINGS_ACCOUNTS)
+RECURRING_TEMPLATES = "recurring_templates"
+COLLECTIONS = (INCOME_CYCLES, TRANSACTIONS, DEBTS, SAVINGS_ACCOUNTS, RECURRING_TEMPLATES)
 
 # A filter is (field, operator, value); a write op is (action, collection, doc_id, data).
 _OPERATORS = {

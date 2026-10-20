@@ -7,9 +7,11 @@ commits every multi-document change as one atomic batch write.
 from __future__ import annotations
 
 import calendar
-from datetime import date, datetime, timedelta
+import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
+from . import firebase_client as _fc
 from .firebase_client import DEBTS, INCOME_CYCLES, SAVINGS_ACCOUNTS, TRANSACTIONS
 from .models import (
     BUCKETS,
@@ -17,6 +19,7 @@ from .models import (
     LINKED_BUCKETS,
     Debt,
     IncomeCycle,
+    RecurringTemplate,
     SavingsAccount,
     Transaction,
     ValidationError,
@@ -25,6 +28,18 @@ from .models import (
 NEEDS_PCT, WANTS_PCT = 0.50, 0.30  # the remaining 20% is savings & debt repayment
 FREQUENCIES = ("Monthly", "Bi-weekly")
 SEED_PREFIX = "seed-"
+PH_FINAL_WITHHOLDING_TAX = 0.20  # 20% final withholding tax on Philippine bank deposit interest
+WIPE_BATCH_SIZE = 400  # Firestore allows at most 500 writes per batch; stay safely under it
+# st.session_state key prefixes owned by the UI forms; cleared when all data is wiped.
+UI_STATE_PREFIXES = ("rec_", "topup_", "new_cycle_", "cycle_edit_", "wipe_")
+
+# v1.1 collection. firebase_client.COLLECTIONS doubles as a whitelist inside LocalMockFirestore
+# (_load / reset / snapshot), so without this guard the mock would silently drop the new
+# collection on the next restart. Once COLLECTIONS in firebase_client.py includes it, this is a no-op.
+RECURRING_TEMPLATES = getattr(_fc, "RECURRING_TEMPLATES", "recurring_templates")
+if RECURRING_TEMPLATES not in _fc.COLLECTIONS:
+    _fc.COLLECTIONS = tuple(_fc.COLLECTIONS) + (RECURRING_TEMPLATES,)
+ALL_COLLECTIONS = tuple(_fc.COLLECTIONS)
 
 
 # ---------------------------------------------------------------- pure math
@@ -109,6 +124,57 @@ def debt_progress(total_amount: float, remaining_balance: float) -> float:
     return max(0.0, min(1.0, (total_amount - remaining_balance) / total_amount))
 
 
+def _clamped_day(year: int, month: int, day: int) -> date:
+    return date(year, month, min(day, calendar.monthrange(year, month)[1]))
+
+
+def next_due_date(due_day: int, today: date) -> date:
+    """Next date on or after ``today`` falling on ``due_day`` (short months use their last day)."""
+    this_month = _clamped_day(today.year, today.month, due_day)
+    if this_month >= today:
+        return this_month
+    year, month = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
+    return _clamped_day(year, month, due_day)
+
+
+def calculate_interest_projection(balance: float, annual_rate_percent: float) -> dict[str, float]:
+    """Project interest on a flat annual rate with the 20% PH final withholding tax applied.
+
+    Simple (non-compounding) estimate; values are unrounded so net == gross * 0.80 exactly.
+    Daily uses 365 days, monthly uses 12 months.
+    """
+    try:
+        bal, rate = float(balance), float(annual_rate_percent)
+    except (TypeError, ValueError):
+        raise ValidationError("Balance and interest rate must be numbers.") from None
+    if not (math.isfinite(bal) and math.isfinite(rate)):
+        raise ValidationError("Balance and interest rate must be finite numbers.")
+    if bal < 0:
+        raise ValidationError("Balance cannot be negative.")
+    if not 0 <= rate <= 100:
+        raise ValidationError("Interest rate must be between 0 and 100 (%).")
+    annual_gross = bal * (rate / 100)
+    annual_net = annual_gross * (1 - PH_FINAL_WITHHOLDING_TAX)
+    return {
+        "daily_gross": annual_gross / 365,
+        "monthly_gross": annual_gross / 12,
+        "annual_gross": annual_gross,
+        "daily_net": annual_net / 365,
+        "monthly_net": annual_net / 12,
+        "annual_net": annual_net,
+    }
+
+
+def portfolio_interest_projection(accounts: list[dict]) -> dict[str, float]:
+    """Sum :func:`calculate_interest_projection` across savings accounts."""
+    total = {k: 0.0 for k in calculate_interest_projection(0, 0)}
+    for acct in accounts:
+        proj = calculate_interest_projection(acct["current_balance"], acct.get("interest_rate", 0))
+        for key, value in proj.items():
+            total[key] += value
+    return total
+
+
 # ------------------------------------------------------------------ service
 class BudgetService:
     def __init__(self, db) -> None:
@@ -123,6 +189,8 @@ class BudgetService:
     def create_cycle(self, cycle_name: str, net_salary: float, start_date: Any,
                      end_date: Any = None, frequency: str = "Monthly",
                      activate: bool = True, cycle_id: Optional[str] = None) -> dict:
+        """Create a cycle. ``end_date`` may be any date on/after ``start_date`` (irregular payroll
+        cutoffs); ``frequency`` only supplies the default end date when ``end_date`` is omitted."""
         start = _to_date(start_date)
         end = _to_date(end_date) if end_date else default_end_date(start, frequency)
         cycle = IncomeCycle.new(
@@ -257,6 +325,29 @@ class BudgetService:
         return sorted(self.db.query(TRANSACTIONS, filters),
                       key=lambda t: (t["date"], t["created_at"]), reverse=True)
 
+    # ---- v1.1: salary top-ups & recurring bills (module-level functions below) ----
+    def top_up_cycle_salary(self, cycle_id: str, additional_amount: float, note: str = "") -> dict:
+        return top_up_cycle_salary(self.db, cycle_id, additional_amount, note)
+
+    def create_recurring_template(self, *args: Any, **kwargs: Any) -> dict:
+        return create_recurring_template(self.db, *args, **kwargs)
+
+    def list_recurring_templates(self) -> list[dict]:
+        return list_recurring_templates(self.db)
+
+    def delete_recurring_template(self, template_id: str) -> None:
+        delete_recurring_template(self.db, template_id)
+
+    def post_recurring_templates(self, cycle_id: str, template_ids: list[str], date_str: Any) -> dict:
+        return post_recurring_templates(self.db, cycle_id, template_ids, date_str)
+
+    # ---- v1.1.1: cycle dates & wipe ----------------------------------
+    def update_cycle_dates(self, cycle_id: str, start_date: Any, end_date: Any) -> dict:
+        return update_cycle_dates(self.db, cycle_id, start_date, end_date)
+
+    def wipe_all_data(self) -> dict[str, int]:
+        return wipe_all_data(self.db)
+
     # ---- sample data --------------------------------------------------
     def seed_sample_data(self, today: Optional[date] = None) -> dict[str, int]:
         """Insert (or reset) a fictional PHP dataset. Idempotent: ids start with 'seed-'."""
@@ -303,6 +394,14 @@ class BudgetService:
                 id=f"{SEED_PREFIX}{key}", name=name, total_amount=total,
                 remaining_balance=remaining, minimum_payment=minimum,
                 due_date=due.isoformat()).to_dict()))
+        bills = [  # (name, amount, category, bucket, channel, target id, due day)
+            ("Meralco Electricity", 3200, "Electricity", "Needs", "Maya", None, 15),
+            ("Fiber Internet", 1299, "Internet", "Needs", "Credit Card", None, 6),
+            ("GoTyme Auto-Save", 1000, "Auto-save", "Savings", "GoTyme", f"{SEED_PREFIX}gotyme", 30)]
+        for n, (name, amount, category, bucket, channel, target, due_day) in enumerate(bills, start=1):
+            reset_ops.append(("set", RECURRING_TEMPLATES, f"{SEED_PREFIX}rec-{n}", RecurringTemplate.new(
+                id=f"{SEED_PREFIX}rec-{n}", name=name, amount=amount, category=category, bucket=bucket,
+                payment_channel=channel, target_account_id=target, due_day=due_day).to_dict()))
         reset_ops += [("delete", TRANSACTIONS, tid, None) for tid in tx_ids]
         self.db.batch_write(reset_ops)  # balances back to their baseline, old seed tx removed
 
@@ -311,4 +410,149 @@ class BudgetService:
                 cycle_id=cycle_id, date=min(start + timedelta(days=offset), today),
                 amount=amount, category=category, bucket=bucket, payment_channel=channel,
                 target_account_id=target, notes=notes, tx_id=tid)
-        return {"cycles": 1, "savings_accounts": len(accounts), "debts": 2, "transactions": len(tx_plan)}
+        return {"cycles": 1, "savings_accounts": len(accounts), "debts": 2, "transactions": len(tx_plan),
+                "recurring_templates": len(bills)}
+
+
+# ------------------------------------------------- v1.1 module-level functions
+def log_transaction(db, cycle_id: str, date: Any, amount: float, category: str, bucket: str,
+                    payment_channel: str, target_account_id: Optional[str] = None,
+                    notes: str = "", tx_id: Optional[str] = None) -> dict:
+    """Log one transaction (same atomic savings/debt routing as ``BudgetService.add_transaction``)."""
+    return BudgetService(db).add_transaction(
+        cycle_id, date, amount, category, bucket, payment_channel,
+        target_account_id=target_account_id, notes=notes, tx_id=tx_id)
+
+
+def top_up_cycle_salary(db, cycle_id: str, additional_amount: float, note: str = "") -> dict:
+    """Add a mid-cycle paycheck (e.g. the 15th/30th) and re-split the new total 50/30/20.
+
+    The 20% bucket absorbs rounding, so the caps always sum exactly to the new net salary.
+    Returns the updated cycle document.
+    """
+    try:
+        amount = round(float(additional_amount), 2)
+    except (TypeError, ValueError):
+        raise ValidationError("Top-up amount must be a number.") from None
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValidationError("Top-up amount must be greater than 0.")
+    cycle = db.get(INCOME_CYCLES, cycle_id)
+    if cycle is None:
+        raise ValidationError("Pay cycle not found.")
+    new_net = round(cycle["net_salary"] + amount, 2)
+    updates = {
+        **calculate_split(new_net),
+        "net_salary": new_net,
+        "top_ups": [*(cycle.get("top_ups") or []), {
+            "amount": amount,
+            "note": str(note or "").strip(),
+            "net_salary_after": new_net,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }],
+    }
+    db.update(INCOME_CYCLES, cycle_id, updates)
+    return {**cycle, **updates}
+
+
+def create_recurring_template(db, name: str, amount: float, category: str, bucket: str,
+                              payment_channel: str, due_day: int,
+                              target_account_id: Optional[str] = None,
+                              template_id: Optional[str] = None) -> dict:
+    template = RecurringTemplate.new(
+        id=template_id, name=name, amount=amount, category=category, bucket=bucket,
+        payment_channel=payment_channel, target_account_id=target_account_id, due_day=due_day)
+    if template_id and db.get(RECURRING_TEMPLATES, template.id) is not None:
+        raise ValidationError(f"Recurring template {template.id} already exists.")
+    if template.bucket == "Savings" and db.get(SAVINGS_ACCOUNTS, template.target_account_id) is None:
+        raise ValidationError("The selected savings account no longer exists.")
+    if template.bucket == "Debt" and db.get(DEBTS, template.target_account_id) is None:
+        raise ValidationError("The selected debt no longer exists.")
+    db.set(RECURRING_TEMPLATES, template.id, template.to_dict())
+    return template.to_dict()
+
+
+def list_recurring_templates(db) -> list[dict]:
+    return sorted(db.query(RECURRING_TEMPLATES), key=lambda t: (t["due_day"], t["name"].lower()))
+
+
+def delete_recurring_template(db, template_id: str) -> None:
+    if db.get(RECURRING_TEMPLATES, template_id) is None:
+        raise ValidationError("Recurring template not found.")
+    db.delete(RECURRING_TEMPLATES, template_id)
+
+
+def post_recurring_templates(db, cycle_id: str, template_ids: list[str], date_str: Any) -> dict:
+    """Post the selected templates as transactions dated ``date_str`` in ``cycle_id``.
+
+    Each template goes through :func:`log_transaction`, so savings/debt balances and cap tracking
+    behave exactly like manual entries. Unknown ids or a bad date/cycle raise before anything is
+    posted. A template that fails on its own (e.g. a debt payment above the remaining balance) is
+    reported in ``failed`` and the rest are still posted.
+    """
+    posting_date = _to_date(date_str).isoformat()
+    if db.get(INCOME_CYCLES, cycle_id) is None:
+        raise ValidationError("Pay cycle not found.")
+    ordered = list(dict.fromkeys(template_ids))  # de-duplicate so nothing posts twice
+    templates = {tid: db.get(RECURRING_TEMPLATES, tid) for tid in ordered}
+    missing = [tid for tid, doc in templates.items() if doc is None]
+    if missing:
+        raise ValidationError(f"Unknown recurring template(s): {', '.join(missing)}.")
+    posted: list[dict] = []
+    failed: list[dict] = []
+    for tid in ordered:
+        tpl = templates[tid]
+        try:
+            posted.append(log_transaction(
+                db, cycle_id, posting_date, tpl["amount"], tpl["category"], tpl["bucket"],
+                tpl["payment_channel"], target_account_id=tpl.get("target_account_id"),
+                notes=f"Recurring: {tpl['name']}"))
+        except ValidationError as exc:
+            failed.append({"template_id": tid, "name": tpl["name"], "error": str(exc)})
+    return {"posted": posted, "failed": failed}
+
+
+# ------------------------------------------------- v1.1.1 module-level functions
+def update_cycle_dates(db, cycle_id: str, start_date: Any, end_date: Any) -> dict:
+    """Change a cycle's start/end dates (any range with end >= start). Returns the updated cycle.
+
+    Transactions belong to a cycle by id, not by date, so existing entries are unaffected.
+    """
+    cycle = db.get(INCOME_CYCLES, cycle_id)
+    if cycle is None:
+        raise ValidationError("Pay cycle not found.")
+    updates = {"start_date": _to_date(start_date).isoformat(), "end_date": _to_date(end_date).isoformat()}
+    IncomeCycle.from_dict({**cycle, **updates})  # raises ValidationError if end < start
+    db.update(INCOME_CYCLES, cycle_id, updates)
+    return {**cycle, **updates}
+
+
+def wipe_all_data(db) -> dict[str, int]:
+    """Delete every document in every collection and verify the database is empty.
+
+    Works through the repository API only, so it is identical for ``LiveFirestore`` and
+    ``LocalMockFirestore``: the mock is cleared with its own ``reset()``; any other backend is
+    emptied with batched deletes (``WIPE_BATCH_SIZE`` per batch). Returns ``{collection: deleted}``.
+    Batches are atomic individually, not across the whole wipe, so after a mid-way failure simply
+    run it again. Raises ``RuntimeError`` if anything is left afterwards.
+    """
+    before = db.snapshot()
+    counts = {name: len(before.get(name, [])) for name in ALL_COLLECTIONS}
+    if getattr(db, "supports_reset", False):
+        db.reset()
+    else:
+        ops = [("delete", name, doc["id"], None)
+               for name in ALL_COLLECTIONS for doc in before.get(name, []) if doc.get("id")]
+        for start in range(0, len(ops), WIPE_BATCH_SIZE):
+            db.batch_write(ops[start:start + WIPE_BATCH_SIZE])
+    remaining = sum(len(docs) for docs in db.snapshot().values())
+    if remaining:
+        raise RuntimeError(f"Wipe incomplete: {remaining} document(s) are still in the database.")
+    return counts
+
+
+def clear_ui_state(state: Any, prefixes: tuple = UI_STATE_PREFIXES) -> list[str]:
+    """Remove form-related keys from a ``st.session_state``-like mapping; returns the removed keys."""
+    doomed = [key for key in list(state.keys()) if isinstance(key, str) and key.startswith(prefixes)]
+    for key in doomed:
+        del state[key]
+    return doomed
