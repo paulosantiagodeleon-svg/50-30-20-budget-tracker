@@ -17,6 +17,10 @@ INCOME_BUCKET = "Income"  # logged income; never counts against the 50/30/20 cap
 LOG_BUCKETS = BUCKETS + (INCOME_BUCKET,)
 PAYMENT_CHANNELS = ("Cash", "Maya", "GoTyme", "MariBank", "Credit Card", "Other")
 LINKED_BUCKETS = ("Savings", "Debt")  # buckets that must point at an account/debt
+SPEND_BUCKETS = ("Needs", "Wants")  # what "daily spend" and unspent-capacity sweeps look at
+SWEEP_CATEGORY = "Rollover sweep"  # category of the grouped Savings transaction made by a sweep (v1.2)
+MAX_SPLIT_PARTS = 50  # rows in one split transaction
+MAX_BATCH_OPS = 400  # Firestore allows 500 writes per batch; stay safely below it
 
 
 class ValidationError(ValueError):
@@ -211,3 +215,27 @@ class RecurringTemplate(_Document):
         else:
             self.target_account_id = None
         self.due_day = _due_day(self.due_day)
+
+
+@dataclass
+class SplitPart:
+    """One row of a split transaction (a slice of a single payment)."""
+
+    category: str
+    bucket: str
+    amount: float
+    target_account_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.category = _text(self.category, "Category")
+        if self.bucket not in LOG_BUCKETS:
+            raise ValidationError(f"Bucket must be one of: {', '.join(LOG_BUCKETS)}.")
+        self.amount = _money(self.amount, "Amount", positive=True)
+        target = _text(self.target_account_id, "Target account", required=False)
+        if self.bucket in LINKED_BUCKETS:
+            if not target:
+                label = "savings account" if self.bucket == "Savings" else "debt"
+                raise ValidationError(f"Select a {label} for a {self.bucket} row.")
+            self.target_account_id = target
+        else:
+            self.target_account_id = None

@@ -4,30 +4,42 @@ Run with:  streamlit run app.py
 """
 from __future__ import annotations
 
+import re
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 
 from src.firebase_client import QUERY_LOG, get_database
-from src.models import LOG_BUCKETS, PAYMENT_CHANNELS, ValidationError
+from src.models import BUCKETS, LOG_BUCKETS, PAYMENT_CHANNELS, SPEND_BUCKETS, ValidationError
 from src.services import (
     ALL_COLLECTIONS,
     FREQUENCIES,
     BudgetService,
+    asset_allocation,
     calculate_interest_projection,
     calculate_split,
     clear_ui_state,
+    collect_tags,
+    daily_spend_series,
     debt_progress,
     default_end_date,
+    filter_by_tags,
+    find_possible_duplicates,
     next_due_date,
+    pacing_summary,
+    parse_bank_csv,
     portfolio_interest_projection,
+    tag_totals,
     top_up_cycle_salary,
+    transactions_to_csv,
+    unspent_capacity,
 )
 
 st.set_page_config(page_title="50/30/20 Budget Tracker", page_icon="💰", layout="wide")
 
-PAGES = ("📊 Dashboard", "🧾 Transactions", "🔁 Recurring Bills", "🏦 Savings", "💳 Debts", "🛠️ Developer")
+PAGES = ("📊 Dashboard", "🧾 Transactions", "🔁 Recurring Bills", "📈 Analytics", "🏦 Savings", "💳 Debts",
+         "🛠️ Developer")
 CATEGORY_HINTS = {
     "Needs": "Rent, Groceries, Utilities, Transportation, Insurance",
     "Wants": "Dining out, Shopping, Subscriptions, Entertainment",
@@ -215,6 +227,34 @@ def render_edit_cycle_dates(cycle: dict) -> None:
             run_action(lambda: service.update_cycle_dates(cycle["id"], start, end), "Cycle dates updated.")
 
 
+def render_sweep(cycle: dict) -> None:
+    with st.expander("🧹 Sweep Unspent to Savings"):
+        info = unspent_capacity(cycle, service.list_transactions(cycle_id=cycle["id"]))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Unspent Needs", peso(info["needs"]))
+        m2.metric("Unspent Wants", peso(info["wants"]))
+        m3.metric("Sweepable now", peso(info["sweepable"]))
+        if info["already_swept"]:
+            st.caption(f"Already swept this cycle: {peso(info['already_swept'])}.")
+        st.caption("Moves the unspent Needs + Wants budget into ONE Savings transaction. A bucket that is over "
+                   "its cap counts as 0. Sweeps are not counted against the 20% cap. To undo, delete the "
+                   "'Rollover sweep' transaction and the savings balance is reversed.")
+        accounts = service.list_savings_accounts()
+        if not accounts:
+            st.info("Add a savings account on the Savings page first.")
+            return
+        labels = {a["id"]: f"{a['bank_name']} - {a['goal_name'] or 'Savings'} ({peso(a['current_balance'])})"
+                  for a in accounts}
+        target = st.selectbox("Sweep into", list(labels), format_func=labels.get, key="sweep_account")
+        confirmed = True
+        if date.today().isoformat() < cycle["end_date"]:
+            confirmed = st.checkbox(f"This cycle ends {cycle['end_date']}. Sweep anyway.", key="sweep_early")
+        if st.button("🧹 Sweep Unspent to Savings", type="primary", key="sweep_btn",
+                     disabled=info["sweepable"] <= 0 or not confirmed):
+            run_action(lambda: service.sweep_unspent_to_savings(cycle["id"], target),
+                       f"Swept {peso(info['sweepable'])} into savings.")
+
+
 def page_dashboard() -> None:
     st.header("Dashboard")
     cycle = active_cycle
@@ -242,8 +282,11 @@ def page_dashboard() -> None:
                 st.warning(f"Over the {key} cap by {peso(-line['remaining'])}.")
     if summary["other_income"]:
         st.caption(f"Extra income logged this cycle: {peso(summary['other_income'])}")
+    if summary["swept"]:
+        st.caption(f"Rolled over to savings: {peso(summary['swept'])} (not counted against the 20% cap).")
     render_top_up_form(cycle)
     render_edit_cycle_dates(cycle)
+    render_sweep(cycle)
 
     st.subheader("Recent transactions")
     recent = service.list_transactions(cycle_id=cycle["id"])[:8]
@@ -265,17 +308,31 @@ def page_dashboard() -> None:
 
 
 # ------------------------------------------------------------ transactions
-def page_transactions() -> None:
-    st.header("Transactions")
-    cycle = active_cycle
-    if cycle is None:
-        st.info("Create a pay cycle on the Dashboard first.")
-        return
+def _cell(value):
+    """A data_editor cell as a plain value (NaN/NaT/None -> None)."""
+    return None if value is None or pd.isna(value) else value
 
-    accounts = service.list_savings_accounts()
-    debts = [d for d in service.list_debts() if d["status"] == "active"]
 
-    st.subheader("Log a transaction")
+def target_options(accounts: list[dict], debts: list[dict]) -> dict[str, str]:
+    """Label -> id for every savings account and active debt a row can point at."""
+    options: dict[str, str] = {}
+    for kind, docs in (("Savings", accounts), ("Debt", debts)):
+        for doc in docs:
+            name = f"{doc['bank_name']} - {doc['goal_name'] or 'Savings'}" if kind == "Savings" else doc["name"]
+            label = f"{kind} · {name}"
+            options[label if label not in options else f"{label} ({doc['id'][:4]})"] = doc["id"]
+    return options
+
+
+def resolve_target(label, bucket, options: dict[str, str]):
+    """Id behind a Target label, but only if its kind matches the row's bucket."""
+    label = _cell(label)
+    if not label or label not in options or not str(label).startswith(f"{bucket} ·"):
+        return None
+    return options[label]
+
+
+def render_single_tx_form(cycle: dict, accounts: list[dict], debts: list[dict]) -> None:
     bucket = st.radio("Bucket", LOG_BUCKETS, horizontal=True)
     st.caption(f"Category ideas: {CATEGORY_HINTS[bucket]}")
     with st.form("tx_form", clear_on_submit=True):
@@ -305,6 +362,162 @@ def page_transactions() -> None:
         run_action(lambda: service.add_transaction(cycle["id"], tx_date, amount, category, bucket,
                                                    channel, target, notes),
                    f"Logged {peso(amount)} under {bucket}.")
+
+
+def render_split_form(cycle: dict, accounts: list[dict], debts: list[dict]) -> None:
+    gen = st.session_state.setdefault("split_gen", 0)  # bumped after a save so the inputs start fresh
+    options = target_options(accounts, debts)
+    c1, c2 = st.columns(2)
+    total = c1.number_input("Total payment amount (₱)", min_value=0.0, step=50.0, format="%.2f",
+                            key=f"split_total_{gen}")
+    tx_date = c2.date_input("Date", value=date.today(), key=f"split_date_{gen}")
+    channel = c1.selectbox("Payment channel", PAYMENT_CHANNELS, key=f"split_channel_{gen}")
+    notes = c2.text_input("Notes (optional) - hashtags like #vacation work", key=f"split_notes_{gen}")
+    st.caption("Add one row per category. Savings and Debt rows also need a Target. "
+               "Use the + at the bottom of the table for more rows.")
+    base = pd.DataFrame({"Category": ["", ""], "Bucket": ["Needs", "Wants"], "Amount": [0.0, 0.0],
+                         "Target": [None, None]})
+    edited = st.data_editor(
+        base, key=f"split_editor_{gen}", num_rows="dynamic", hide_index=True,
+        column_config={
+            "Category": st.column_config.TextColumn("Category", required=True),
+            "Bucket": st.column_config.SelectboxColumn("Bucket", options=list(LOG_BUCKETS), required=True),
+            "Amount": st.column_config.NumberColumn("Amount (₱)", min_value=0.0, step=50.0, format="%.2f"),
+            "Target": st.column_config.SelectboxColumn("Target (Savings/Debt rows)", options=list(options)),
+        })
+    parts = []
+    for _, row in edited.iterrows():
+        category = str(_cell(row["Category"]) or "").strip()
+        amount = float(_cell(row["Amount"]) or 0.0)
+        if not category and amount == 0:
+            continue  # ignore untouched rows
+        bucket = _cell(row["Bucket"])
+        parts.append({"category": category, "bucket": bucket, "amount": amount,
+                      "target_account_id": resolve_target(row["Target"], bucket, options)})
+    allocated = round(sum(p["amount"] for p in parts), 2)
+    remaining = round(total - allocated, 2)
+    if total <= 0:
+        st.info("Enter the total payment amount.")
+    elif remaining == 0:
+        st.success(f"Fully allocated: {peso(allocated)} of {peso(total)}.")
+    else:
+        st.warning(f"Allocated {peso(allocated)} of {peso(total)} · "
+                   f"{'remaining' if remaining > 0 else 'over by'} {peso(abs(remaining))}")
+    if not (cycle["start_date"] <= tx_date.isoformat() <= cycle["end_date"]):
+        st.warning("That date is outside the active pay cycle.")
+
+    def save() -> None:
+        service.log_split_transaction(cycle["id"], tx_date, channel, parts, total_amount=total, notes=notes)
+        st.session_state["split_gen"] = gen + 1
+
+    if st.button("Add split transaction", type="primary", key=f"split_btn_{gen}", disabled=not parts):
+        run_action(save, f"Logged {peso(total)} split across {len(parts)} rows.")
+
+
+def render_import_export(cycle: dict, accounts: list[dict]) -> None:
+    with st.expander("📤 Export / 📥 Import CSV"):
+        debts = [d for d in service.list_debts() if d["status"] == "active"]
+        everything = service.list_transactions(cycle_id=cycle["id"])
+        names = {a["id"]: a["bank_name"] for a in accounts}
+        names.update({d["id"]: d["name"] for d in service.list_debts()})
+
+        st.markdown("**Export this cycle**")
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", cycle["cycle_name"]).strip("_") or "cycle"
+        st.download_button("⬇️ Download transactions (CSV)", key="tx_export", mime="text/csv",
+                           data=transactions_to_csv(everything, names).encode("utf-8-sig"),
+                           file_name=f"transactions_{slug}.csv", disabled=not everything)
+        st.divider()
+
+        st.markdown("**Import a bank CSV** (needs Date, Amount and Description columns)")
+        gen = st.session_state.setdefault("imp_gen", 0)  # bumped after an import to reset the uploader
+        c1, c2 = st.columns(2)
+        dayfirst = c1.checkbox("Dates are day-first (DD/MM/YYYY)", key=f"imp_dayfirst_{gen}")
+        default_channel = c2.selectbox("Default payment channel", PAYMENT_CHANNELS,
+                                       index=PAYMENT_CHANNELS.index("Other"), key=f"imp_channel_{gen}")
+        upload = st.file_uploader("Choose a CSV file", type=["csv"], key=f"imp_file_{gen}")
+        if upload is None:
+            return
+        data = upload.getvalue()
+        signature = (upload.name, len(data), dayfirst, default_channel)
+        if st.session_state.get(f"imp_sig_{gen}") != signature:  # (re)parse only when the file/options change
+            try:
+                parsed = parse_bank_csv(data, dayfirst=dayfirst)
+            except ValidationError as exc:
+                st.error(str(exc))
+                return
+            dupes = find_possible_duplicates(parsed["rows"], everything)
+            st.session_state[f"imp_df_{gen}"] = pd.DataFrame({
+                "Import": [not dup and r["date"] is not None and r["amount"] is not None
+                           for r, dup in zip(parsed["rows"], dupes)],
+                "Date": pd.to_datetime(pd.Series([r["date"] for r in parsed["rows"]]), errors="coerce"),
+                "Amount": [r["amount"] for r in parsed["rows"]],
+                "Description": [r["description"] for r in parsed["rows"]],
+                "Category": [r["category"] for r in parsed["rows"]],
+                "Bucket": [r["bucket"] for r in parsed["rows"]],
+                "Channel": [r["payment_channel"] or default_channel for r in parsed["rows"]],
+                "Target": [None] * len(parsed["rows"]),
+                "Possible duplicate": dupes,
+            })
+            st.session_state[f"imp_warn_{gen}"] = parsed["warnings"]
+            st.session_state[f"imp_sig_{gen}"] = signature
+            st.session_state[f"imp_ver_{gen}"] = st.session_state.get(f"imp_ver_{gen}", 0) + 1
+
+        for warning in st.session_state.get(f"imp_warn_{gen}", []):
+            st.warning(warning)
+        st.caption("Map each row to a bucket below. Rows matching an existing date + amount are flagged and "
+                   "start unticked. Savings and Debt rows need a Target. Bucket guesses are only suggestions.")
+        options = target_options(accounts, debts)
+        edited = st.data_editor(
+            st.session_state[f"imp_df_{gen}"], key=f"imp_editor_{gen}_{st.session_state[f'imp_ver_{gen}']}",
+            hide_index=True, num_rows="fixed", disabled=["Possible duplicate"],
+            column_config={
+                "Import": st.column_config.CheckboxColumn("Import"),
+                "Date": st.column_config.DateColumn("Date", format="YYYY-MM-DD"),
+                "Amount": st.column_config.NumberColumn("Amount (₱)", min_value=0.0, format="%.2f"),
+                "Bucket": st.column_config.SelectboxColumn("Bucket", options=list(LOG_BUCKETS), required=True),
+                "Channel": st.column_config.SelectboxColumn("Channel", options=list(PAYMENT_CHANNELS), required=True),
+                "Target": st.column_config.SelectboxColumn("Target (Savings/Debt)", options=list(options)),
+            })
+        rows = []
+        for _, r in edited.iterrows():
+            if not r["Import"]:
+                continue
+            when = _cell(r["Date"])
+            when = when.date() if hasattr(when, "date") else when
+            description = str(_cell(r["Description"]) or "").strip()
+            bucket = _cell(r["Bucket"])
+            rows.append({"date": when, "amount": _cell(r["Amount"]), "bucket": bucket,
+                         "category": str(_cell(r["Category"]) or "").strip() or description[:40],
+                         "payment_channel": _cell(r["Channel"]), "notes": description,
+                         "target_account_id": resolve_target(r["Target"], bucket, options)})
+        total = sum(row["amount"] or 0 for row in rows)
+        st.caption(f"{len(rows)} of {len(edited)} rows selected · total {peso(total)}")
+
+        def commit() -> None:
+            service.import_transactions(cycle["id"], rows, default_channel)
+            st.session_state["imp_gen"] = gen + 1
+
+        if st.button("Import selected rows", type="primary", key=f"imp_btn_{gen}", disabled=not rows):
+            run_action(commit, f"Imported {len(rows)} transaction(s) totalling {peso(total)}.")
+
+
+def page_transactions() -> None:
+    st.header("Transactions")
+    cycle = active_cycle
+    if cycle is None:
+        st.info("Create a pay cycle on the Dashboard first.")
+        return
+
+    accounts = service.list_savings_accounts()
+    debts = [d for d in service.list_debts() if d["status"] == "active"]
+
+    st.subheader("Log a transaction")
+    if st.toggle("Split transaction", key="tx_split",
+                 help="Divide one payment across several categories and buckets."):
+        render_split_form(cycle, accounts, debts)
+    else:
+        render_single_tx_form(cycle, accounts, debts)
+    render_import_export(cycle, accounts)
 
     st.subheader("History")
     f1, f2 = st.columns(2)
@@ -426,6 +639,84 @@ def page_recurring() -> None:
                    f"Added recurring bill {name}.")
 
 
+# --------------------------------------------------------------- analytics
+def page_analytics() -> None:
+    st.header("Analytics")
+    try:
+        import plotly.express as px
+    except ImportError:
+        st.error("The Analytics page needs Plotly. Install it (PowerShell) and restart the app:")
+        st.code("pip install plotly", language="powershell")
+        return
+
+    st.subheader("Savings asset allocation")
+    allocation = asset_allocation(service.list_savings_accounts())
+    if allocation:
+        fig = px.pie(pd.DataFrame(allocation), names="account", values="balance", hole=0.55)
+        fig.update_traces(textinfo="percent+label",
+                          hovertemplate="%{label}<br>₱%{value:,.2f} (%{percent})<extra></extra>")
+        fig.update_layout(margin={"t": 10, "b": 10})
+        st.plotly_chart(fig)
+        st.caption(f"Total across accounts: {peso(sum(a['balance'] for a in allocation))}. "
+                   "This chart shows balances, so the hashtag filter below does not apply to it.")
+    else:
+        st.info("No savings balances yet. Add an account on the Savings page.")
+
+    st.subheader("Daily spend pacing")
+    cycle = active_cycle
+    if cycle is None:
+        st.info("Create a pay cycle on the Dashboard first.")
+        return
+    txs = service.list_transactions(cycle_id=cycle["id"])
+    tags = collect_tags(txs)
+    st.session_state["ana_tags"] = [t for t in st.session_state.get("ana_tags", []) if t in tags]
+    f1, f2, f3 = st.columns([3, 1, 2])
+    selected = f1.multiselect("Filter by hashtag (from transaction notes)", list(tags),
+                              format_func=lambda t: f"#{t} ({tags[t]})", key="ana_tags")
+    match_all = f2.checkbox("Match all", key="ana_match_all", disabled=len(selected) < 2)
+    buckets = f3.multiselect("Buckets", list(BUCKETS), default=list(SPEND_BUCKETS), key="ana_buckets")
+    if not tags:
+        st.caption("Tip: put hashtags in a transaction's notes, e.g. `GPU #pc-build`, to track them here.")
+    if not buckets:
+        st.info("Pick at least one bucket.")
+        return
+
+    filtered = filter_by_tags(txs, selected, match_all)
+    if selected:
+        joiner = " and " if match_all else " or "
+        st.caption(f"Showing {len(filtered)} of {len(txs)} transactions tagged "
+                   f"{joiner.join('#' + t for t in selected)}.")
+    pace = pacing_summary(cycle, filtered, buckets=buckets)
+    m1, m2, m3 = st.columns(3)
+    if selected:
+        m1.metric("Spent (filtered)", peso(pace["spent"]))
+    else:
+        variance = pace["variance"]
+        m1.metric("Spent so far", peso(pace["spent"]),
+                  delta=(f"{peso(variance)} under pace" if pace["on_track"] else f"-{peso(-variance)} over pace"))
+        m2.metric("Even-pace target to date", peso(pace["target_to_date"]))
+    m3.metric("Projected cycle total", peso(pace["projected_total"]),
+              help="Spend so far extended at the same daily rate through the end of the cycle.")
+    if pace["outside_range"]:
+        st.caption(f"{pace['outside_range']} transaction(s) dated outside this cycle are not shown.")
+
+    series = pd.DataFrame(daily_spend_series(cycle, filtered, buckets))
+    fig = px.bar(series, x="date", y="amount", color="bucket", barmode="stack",
+                 labels={"date": "Day", "amount": "Spent", "bucket": "Bucket"})
+    if not selected:
+        fig.add_hline(y=pace["target_per_day"], line_dash="dash", annotation_position="top left",
+                      annotation_text=f"Even pace {peso(pace['target_per_day'])}/day")
+    fig.update_layout(yaxis_tickprefix="₱", yaxis_tickformat=",.0f", margin={"t": 30, "b": 10})
+    st.plotly_chart(fig)
+
+    totals = tag_totals(txs)
+    if totals:
+        st.subheader("Spend by hashtag")
+        st.dataframe(pd.DataFrame([{"Hashtag": f"#{r['tag']}", "Transactions": r["count"], "Total": r["amount"]}
+                                   for r in totals]), hide_index=True)
+        st.caption("A transaction with several hashtags counts toward each. Income and sweeps are excluded.")
+
+
 # ----------------------------------------------------------------- savings
 def page_savings() -> None:
     st.header("Savings & Digital Bank Routing")
@@ -542,5 +833,5 @@ def page_developer() -> None:
 
 
 {"📊 Dashboard": page_dashboard, "🧾 Transactions": page_transactions,
- "🔁 Recurring Bills": page_recurring, "🏦 Savings": page_savings,
+ "🔁 Recurring Bills": page_recurring, "📈 Analytics": page_analytics, "🏦 Savings": page_savings,
  "💳 Debts": page_debts, "🛠️ Developer": page_developer}[page]()

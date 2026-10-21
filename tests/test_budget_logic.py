@@ -15,7 +15,7 @@ from src.firebase_client import (
     QueryLogger,
     get_database,
 )
-from src.models import Debt, RecurringTemplate, Transaction, ValidationError
+from src.models import Debt, RecurringTemplate, SplitPart, Transaction, ValidationError
 from src.services import (
     ALL_COLLECTIONS,
     RECURRING_TEMPLATES,
@@ -37,6 +37,22 @@ from src.services import (
     top_up_cycle_salary,
     update_cycle_dates,
     wipe_all_data,
+)
+from src.services import (  # v1.2 additions
+    asset_allocation,
+    collect_tags,
+    daily_spend_series,
+    extract_hashtags,
+    filter_by_tags,
+    find_possible_duplicates,
+    pacing_summary,
+    parse_amount,
+    parse_bank_csv,
+    parse_date_text,
+    sweep_unspent_to_savings,
+    tag_totals,
+    transactions_to_csv,
+    unspent_capacity,
 )
 
 
@@ -689,3 +705,472 @@ def test_clear_ui_state_removes_only_form_keys():
     assert sorted(removed) == ["cycle_edit_start_abc", "new_cycle_end", "rec_chk_1", "rec_post_date",
                                "topup_amount", "wipe_confirm_text"]
     assert state == {"_flash": "hi", "other": 1}
+
+
+# =====================================================================  v1.2.0
+OCT_CYCLE = {"start_date": "2026-10-01", "end_date": "2026-10-10", "net_salary": 20000, **calculate_split(20000)}
+
+
+# --------------------------------------------------------- hashtag extraction
+def test_extract_hashtags_finds_lowercase_unique_tags_in_order():
+    assert extract_hashtags("New GPU #pc-build and fan #PC-Build #vacation_2026") == ["pc-build", "vacation_2026"]
+    assert extract_hashtags("Trip #vacation, hotel (#vacation) #Cebu.") == ["vacation", "cebu"]
+    assert extract_hashtags("#goals2026!") == ["goals2026"]
+    assert extract_hashtags("#piñata-party #Pasko") == ["piñata-party", "pasko"]
+
+
+def test_extract_hashtags_ignores_things_that_are_not_tags():
+    for text in ("C# is fun", "see page#top", "item #1", "##double", "me@x.com#frag", "no tags", "", None):
+        assert extract_hashtags(text) == [], text
+    assert extract_hashtags("#trip- next #a--b") == ["trip", "a"]  # trailing/double separators are not part of a tag
+
+
+def test_collect_tags_counts_transactions_not_occurrences():
+    txs = [{"notes": "#a #b"}, {"notes": "#a #a"}, {"notes": "x #c"}, {"notes": ""}, {}]
+    tags = collect_tags(txs)
+    assert tags == {"a": 2, "b": 1, "c": 1}
+    assert list(tags) == ["a", "b", "c"]  # most used first, ties alphabetical
+
+
+def test_filter_by_tags_any_all_and_normalisation():
+    txs = [{"id": 1, "notes": "#pc-build GPU"}, {"id": 2, "notes": "#vacation #pc-build"}, {"id": 3, "notes": "lunch"}]
+    assert [t["id"] for t in filter_by_tags(txs, ["pc-build"])] == [1, 2]
+    assert [t["id"] for t in filter_by_tags(txs, ["#PC-Build "])] == [1, 2]
+    assert [t["id"] for t in filter_by_tags(txs, ["vacation", "pc-build"])] == [1, 2]  # any
+    assert [t["id"] for t in filter_by_tags(txs, ["vacation", "pc-build"], match_all=True)] == [2]
+    assert [t["id"] for t in filter_by_tags(txs, [])] == [1, 2, 3]
+    assert filter_by_tags(txs, ["nope"]) == []
+
+
+def test_tag_totals_skip_income_and_sweeps():
+    txs = [
+        {"bucket": "Needs", "amount": 100, "category": "x", "notes": "#pc"},
+        {"bucket": "Wants", "amount": 50, "category": "x", "notes": "#pc #game"},
+        {"bucket": "Income", "amount": 999, "category": "x", "notes": "#pc"},
+        {"bucket": "Savings", "amount": 500, "category": "Rollover sweep", "notes": "#rollover"},
+    ]
+    assert tag_totals(txs) == [{"tag": "pc", "count": 2, "amount": 150},
+                               {"tag": "game", "count": 1, "amount": 50}]
+
+
+# ------------------------------------------------------ analytics data layer
+def test_asset_allocation_shares_and_empty_accounts():
+    accounts = [{"bank_name": "GoTyme", "goal_name": "Go Save", "current_balance": 3000},
+                {"bank_name": "Maya", "goal_name": "", "current_balance": 1000},
+                {"bank_name": "Empty", "goal_name": "", "current_balance": 0}]
+    rows = asset_allocation(accounts)
+    assert [(r["account"], r["balance"], r["share"]) for r in rows] == [
+        ("GoTyme - Go Save", 3000, 75.0), ("Maya", 1000, 25.0)]
+    assert asset_allocation([]) == []
+
+
+def test_daily_spend_series_is_zero_filled_and_ignores_out_of_scope_rows():
+    txs = [
+        {"bucket": "Needs", "amount": 100, "date": "2026-10-02", "category": "a"},
+        {"bucket": "Needs", "amount": 30, "date": "2026-10-02", "category": "b"},
+        {"bucket": "Wants", "amount": 50, "date": "2026-10-02", "category": "c"},
+        {"bucket": "Needs", "amount": 999, "date": "2026-10-15", "category": "outside the cycle"},
+        {"bucket": "Savings", "amount": 700, "date": "2026-10-03", "category": "Save"},
+        {"bucket": "Savings", "amount": 800, "date": "2026-10-04", "category": "Rollover sweep"},
+    ]
+    rows = daily_spend_series(OCT_CYCLE, txs)
+    assert len(rows) == 10 * 2 and rows[0] == {"date": "2026-10-01", "bucket": "Needs", "amount": 0}
+    day2 = {r["bucket"]: r["amount"] for r in rows if r["date"] == "2026-10-02"}
+    assert day2 == {"Needs": 130, "Wants": 50}
+    assert sum(r["amount"] for r in rows) == 180
+    assert len(daily_spend_series(OCT_CYCLE, txs, ("Needs",))) == 10
+    with_savings = daily_spend_series(OCT_CYCLE, txs, ("Savings",))
+    assert sum(r["amount"] for r in with_savings) == 700  # the sweep is not "spending"
+    with pytest.raises(ValidationError):
+        daily_spend_series(OCT_CYCLE, txs, ("Needs", "Income"))
+
+
+def test_pacing_summary_under_over_and_edges():
+    base = [{"bucket": "Needs", "amount": 5000, "date": "2026-10-02", "category": "r"},
+            {"bucket": "Wants", "amount": 1500, "date": "2026-10-04", "category": "g"},
+            {"bucket": "Needs", "amount": 400, "date": "2026-11-01", "category": "outside"}]
+    p = pacing_summary(OCT_CYCLE, base, date(2026, 10, 5))
+    assert (p["days_total"], p["days_elapsed"]) == (10, 5)
+    assert p["target_total"] == 16000 and p["target_per_day"] == 1600 and p["target_to_date"] == 8000
+    assert p["spent"] == 6500 and p["variance"] == 1500 and p["on_track"] is True
+    assert p["projected_total"] == 13000 and p["outside_range"] == 1
+    over = pacing_summary(OCT_CYCLE, base + [{"bucket": "Wants", "amount": 2500, "date": "2026-10-05",
+                                              "category": "x"}], date(2026, 10, 5))
+    assert over["spent"] == 9000 and over["variance"] == -1000 and over["on_track"] is False
+    before = pacing_summary(OCT_CYCLE, [], date(2026, 9, 20))
+    assert before["days_elapsed"] == 0 and before["target_to_date"] == 0 and before["projected_total"] == 0
+    assert pacing_summary(OCT_CYCLE, [], date(2026, 12, 1))["days_elapsed"] == 10  # capped at the cycle length
+    assert pacing_summary(OCT_CYCLE, [], date(2026, 10, 5), ("Savings", "Debt"))["target_total"] == 4000
+
+
+# ------------------------------------------------------------ rollover sweep
+def _spend_for_sweep(service, cycle, account):
+    service.add_transaction(cycle["id"], "2026-10-02", 9000.50, "Rent", "Needs", "Cash")
+    service.add_transaction(cycle["id"], "2026-10-03", 2500.25, "Games", "Wants", "Maya")
+    service.add_transaction(cycle["id"], "2026-10-04", 2000, "Save", "Savings", "Cash",
+                            target_account_id=account["id"])
+
+
+def test_unspent_capacity_calculation_and_overspent_buckets():
+    cycle = {"net_salary": 30000, **calculate_split(30000)}
+    txs = [{"bucket": "Needs", "amount": 9000.50, "category": "a"}, {"bucket": "Wants", "amount": 2500.25, "category": "b"},
+           {"bucket": "Savings", "amount": 2000, "category": "c"}, {"bucket": "Debt", "amount": 1000, "category": "d"},
+           {"bucket": "Income", "amount": 500, "category": "e"}]
+    info = unspent_capacity(cycle, txs)
+    assert info["needs"] == pytest.approx(5999.50) and info["wants"] == pytest.approx(6499.75)
+    assert info["total"] == info["sweepable"] == pytest.approx(12499.25) and info["already_swept"] == 0
+    assert unspent_capacity(cycle, [])["total"] == 24000  # Savings/Debt/Income never change it
+    over = unspent_capacity(cycle, [{"bucket": "Needs", "amount": 16000, "category": "a"},
+                                    {"bucket": "Wants", "amount": 7000, "category": "b"}])
+    assert (over["needs"], over["wants"], over["total"]) == (0, 2000, 2000)  # overspent Needs is not netted
+
+
+def test_sweep_creates_one_grouped_savings_transaction_and_updates_balance():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        _spend_for_sweep(service, cycle, account)  # account balance is now 3,000
+        result = sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))
+        assert result["amount"] == pytest.approx(12499.25)
+        assert (result["needs"], result["wants"]) == (pytest.approx(5999.50), pytest.approx(6499.75))
+        tx = result["transaction"]
+        assert (tx["bucket"], tx["category"], tx["date"]) == ("Savings", "Rollover sweep", "2026-10-31")
+        assert tx["target_account_id"] == account["id"] and "#rollover" in tx["notes"]
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == pytest.approx(3000 + 12499.25)
+        assert result["account"]["current_balance"] == pytest.approx(15499.25)
+        assert len([t for t in service.list_transactions(cycle["id"]) if t["category"] == "Rollover sweep"]) == 1
+
+
+def test_sweep_is_not_counted_against_the_20_percent_cap():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        _spend_for_sweep(service, cycle, account)
+        service.sweep_unspent_to_savings(cycle["id"], account["id"], date(2026, 10, 31))
+        summary = service.cycle_summary(db.get("income_cycles", cycle["id"]))
+        assert summary["swept"] == pytest.approx(12499.25)
+        assert summary["lines"]["Savings & Debt"]["spent"] == pytest.approx(2000)  # only the planned saving
+        assert summary["spent"]["Savings"] == pytest.approx(14499.25)
+        assert summary["total_allocated"] == pytest.approx(26000)
+
+
+def test_sweep_cannot_move_the_same_money_twice_and_can_be_undone():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        service.add_transaction(cycle["id"], "2026-10-02", 9000.50, "Rent", "Needs", "Cash")
+        first = sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))
+        assert first["amount"] == pytest.approx(14999.50)
+        with pytest.raises(ValidationError):
+            sweep_unspent_to_savings(db, cycle["id"], account["id"])  # nothing new to sweep
+        service.add_transaction(cycle["id"], "2026-10-05", 1000, "Fare", "Needs", "Cash")
+        with pytest.raises(ValidationError):  # spending after a sweep never claws money back
+            sweep_unspent_to_savings(db, cycle["id"], account["id"])
+        service.delete_transaction(first["transaction"]["id"])
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1000
+        again = sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))
+        assert again["amount"] == pytest.approx(24000 - 9000.50 - 1000)
+
+
+def test_second_sweep_only_moves_newly_freed_capacity():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        rent = service.add_transaction(cycle["id"], "2026-10-02", 9000.50, "Rent", "Needs", "Cash")
+        sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))
+        service.delete_transaction(rent["id"])  # frees 9,000.50 of Needs capacity
+        second = sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))
+        assert second["amount"] == pytest.approx(9000.50) and second["already_swept"] == pytest.approx(14999.50)
+        assert "already swept" in second["transaction"]["notes"]
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == pytest.approx(25000)
+
+
+def test_sweep_validation_changes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        service.add_transaction(cycle["id"], "2026-10-02", 16000, "Big", "Needs", "Cash")
+        service.add_transaction(cycle["id"], "2026-10-02", 9500, "Big", "Wants", "Cash")  # both overspent
+        before = len(service.list_transactions(cycle["id"]))
+        for cid, target in (("no-cycle", account["id"]), (cycle["id"], None), (cycle["id"], "no-account"),
+                            (cycle["id"], account["id"])):  # the last one has nothing to sweep
+            with pytest.raises(ValidationError):
+                sweep_unspent_to_savings(db, cid, target)
+        assert len(service.list_transactions(cycle["id"])) == before
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1000
+
+
+def test_sweep_date_is_clamped_into_the_cycle():
+    for today, expected in ((date(2026, 9, 1), "2026-10-01"), (date(2026, 12, 5), "2026-10-31"),
+                            (date(2026, 10, 15), "2026-10-15")):
+        with tempfile.TemporaryDirectory() as tmp:
+            service, db = make_service(tmp)
+            cycle, account, _ = setup_world(service)
+            assert sweep_unspent_to_savings(db, cycle["id"], account["id"], today)["transaction"]["date"] == expected
+
+
+# ------------------------------------------------------- split transactions
+def test_split_transaction_creates_linked_documents_that_share_notes_and_timestamp():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        result = service.log_split_transaction(
+            cycle["id"], "2026-10-05", "Maya",
+            [{"category": "Groceries", "bucket": "Needs", "amount": 2000},
+             {"category": "Steam Game", "bucket": "Wants", "amount": 1500}],
+            total_amount=3500, notes="Mall run #errands")
+        gid = result["split_id"]
+        stored = sorted(service.list_transactions(cycle["id"]), key=lambda t: t["notes"])
+        assert result["total"] == 3500 and len(stored) == 2
+        assert [t["notes"] for t in stored] == [f"Mall run #errands | split {gid} 1/2",
+                                                f"Mall run #errands | split {gid} 2/2"]
+        assert len({t["created_at"] for t in stored}) == 1
+        assert {(t["category"], t["bucket"], t["amount"]) for t in stored} == {
+            ("Groceries", "Needs", 2000), ("Steam Game", "Wants", 1500)}
+        assert collect_tags(stored) == {"errands": 2}
+        spent = service.cycle_summary(db.get("income_cycles", cycle["id"]))["spent"]
+        assert spent["Needs"] == 2000 and spent["Wants"] == 1500
+
+
+def test_split_total_must_match_and_failure_writes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        parts = [{"category": "A", "bucket": "Needs", "amount": 2000}, {"category": "B", "bucket": "Wants", "amount": 1400}]
+        with pytest.raises(ValidationError):
+            service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", parts, total_amount=3500)
+        assert db.query(TRANSACTIONS) == []
+        ok = service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", parts)  # no total: use the sum
+        assert ok["total"] == 3400
+
+
+def test_split_routes_savings_and_debt_in_one_atomic_batch():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        db.logger.clear()
+        service.log_split_transaction(cycle["id"], "2026-10-05", "GoTyme", [
+            {"category": "Save", "bucket": "Savings", "amount": 500, "target_account_id": account["id"]},
+            {"category": "Save more", "bucket": "Savings", "amount": 250, "target_account_id": account["id"]},
+            {"category": "Card", "bucket": "Debt", "amount": 300, "target_account_id": debt["id"]},
+            {"category": "Lunch", "bucket": "Needs", "amount": 100}], total_amount=1150)
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1750  # both rows accumulate
+        assert db.get(DEBTS, debt["id"])["remaining_balance"] == 7700
+        batches = [e for e in db.logger.recent() if e["operation"].startswith("BATCH")]
+        assert len(batches) == 1 and batches[0]["result_count"] == 7  # 4 documents + 3 balance updates
+
+
+def test_split_is_all_or_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        with pytest.raises(ValidationError) as err:
+            service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", [
+                {"category": "Save", "bucket": "Savings", "amount": 500, "target_account_id": account["id"]},
+                {"category": "Lunch", "bucket": "Needs", "amount": 100},
+                {"category": "Card", "bucket": "Debt", "amount": 9000, "target_account_id": debt["id"]}])
+        assert "Row 3" in str(err.value) and "exceeds" in str(err.value)
+        assert db.query(TRANSACTIONS) == []
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1000
+        assert db.get(DEBTS, debt["id"])["remaining_balance"] == 8000
+
+
+def test_split_validation_errors_name_the_row():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        good = {"category": "A", "bucket": "Needs", "amount": 10}
+        cases = [
+            ([good], "at least two"),
+            ([good, {"category": "B", "bucket": "Nonsense", "amount": 10}], "Row 2"),
+            ([{"category": "B", "bucket": "Savings", "amount": 10}, good], "Row 1"),
+            ([good, {"category": "B", "bucket": "Savings", "amount": 10, "target_account_id": "ghost"}], "Row 2"),
+            ([good, {"category": "B", "bucket": "Wants", "amount": -5}], "Row 2"),
+            ([good, {"category": "", "bucket": "Wants", "amount": 5}], "Row 2"),
+            ([good] * 51, "at most 50"),
+        ]
+        for parts, fragment in cases:
+            with pytest.raises(ValidationError) as err:
+                service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", parts)
+            assert fragment in str(err.value), (fragment, str(err.value))
+        for bad_total in (0, "abc", -1):
+            with pytest.raises(ValidationError):
+                service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", [good, good], total_amount=bad_total)
+        with pytest.raises(ValidationError):
+            service.log_split_transaction("no-cycle", "2026-10-05", "Cash", [good, good])
+        assert db.query(TRANSACTIONS) == []
+        parts = [SplitPart(category="A", bucket="Needs", amount=10), SplitPart(category="B", bucket="Wants", amount=5)]
+        assert service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", parts, 15)["total"] == 15
+
+
+# --------------------------------------------------------------- CSV parsing
+def test_parse_amount_handles_bank_formats():
+    good = {"1,250.00": 1250, "-1250": -1250, "(1,250.50)": -1250.5, "₱1,250.00": 1250, "PHP 99.5": 99.5,
+            "1250 DR": -1250, "1250 CR": 1250, "500-": -500, "+75": 75, " 42 ": 42}
+    for text, expected in good.items():
+        assert parse_amount(text) == pytest.approx(expected), text
+    for bad in ("", "abc", "1,2,x", None, "nan", "inf"):
+        with pytest.raises(ValidationError):
+            parse_amount(bad)
+
+
+def test_parse_date_text_formats_and_day_first():
+    for text in ("2026-10-26", "10/26/2026", "26/10/2026", "Oct 26, 2026", "26 Oct 2026", "10/26/26",
+                 "2026-10-26 14:03:00", "2026-10-26T14:03:00", "10/26/2026 14:03"):
+        assert parse_date_text(text) == date(2026, 10, 26), text
+    assert parse_date_text("03/04/2026") == date(2026, 3, 4)  # month first by default
+    assert parse_date_text("03/04/2026", dayfirst=True) == date(2026, 4, 3)
+    for bad in ("", "not a date", "13/13/2026", None):
+        with pytest.raises(ValidationError):
+            parse_date_text(bad)
+
+
+STANDARD_CSV = """Date,Amount,Description
+2026-10-27,-1250.00,MERALCO PAYMENT
+2026-10-28,-549.00,Netflix
+2026-10-30,25000.00,Salary credit
+
+2026-10-31,-300.00,Random store
+"""
+
+
+def test_parse_bank_csv_standard_rows_with_bucket_suggestions():
+    parsed = parse_bank_csv(STANDARD_CSV)
+    rows = parsed["rows"]
+    assert parsed["warnings"] == [] and len(rows) == 4  # the blank line is skipped
+    assert [r["amount"] for r in rows] == [1250, 549, 25000, 300]  # amounts are stored positive
+    assert [r["date"] for r in rows][0] == date(2026, 10, 27)
+    assert [r["bucket"] for r in rows] == ["Needs", "Wants", "Income", "Wants"]
+    assert rows[0]["description"] == "MERALCO PAYMENT" and rows[0]["category"] == "MERALCO PAYMENT"
+    assert all(r["payment_channel"] == "" for r in rows)
+
+
+def test_parse_bank_csv_accepts_bytes_bom_crlf_and_other_layouts():
+    raw = ("\ufeff" + STANDARD_CSV.replace("\n", "\r\n")).encode("utf-8")
+    assert len(parse_bank_csv(raw)["rows"]) == 4
+    all_positive = parse_bank_csv("Date,Amount,Description\n2026-10-01,5000,Payroll\n2026-10-02,300,Mystery\n")
+    assert [r["bucket"] for r in all_positive["rows"]] == ["Income", "Wants"]  # no negatives: keywords decide
+    split_cols = parse_bank_csv("Transaction Date,Details,Debit,Credit\n10/05/2026,Rent,\"12,000.00\",\n"
+                                "10/06/2026,Refund,,500.00\n")
+    assert [(r["amount"], r["bucket"]) for r in split_cols["rows"]] == [(12000, "Needs"), (500, "Income")]
+    day_first = parse_bank_csv("Date,Amount,Description\n03/04/2026,-10,x\n", dayfirst=True)
+    assert day_first["rows"][0]["date"] == date(2026, 4, 3)
+
+
+def test_parse_bank_csv_reports_bad_rows_and_missing_columns():
+    parsed = parse_bank_csv("Date,Amount,Description\n2026-10-01,-10,ok\nnot a date,-20,bad date\n2026-10-03,abc,bad amount\n")
+    assert [(r["date"] is None, r["amount"] is None) for r in parsed["rows"]] == [(False, False), (True, False), (False, True)]
+    assert len(parsed["warnings"]) == 2 and "Line 3" in parsed["warnings"][0] and "Line 4" in parsed["warnings"][1]
+    for text, fragment in (("Amount,Description\n1,x\n", "Date column"), ("Date,Amount\n2026-10-01,5\n", "Description column"),
+                           ("Date,Description\n2026-10-01,x\n", "Amount"), ("", "empty"),
+                           ("Date,Amount,Description\n", "No transaction rows")):
+        with pytest.raises(ValidationError) as err:
+            parse_bank_csv(text)
+        assert fragment in str(err.value), (fragment, str(err.value))
+
+
+def test_csv_export_round_trips_and_neutralises_formulas():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        service.add_transaction(cycle["id"], "2026-10-05", 2000, "Groceries", "Needs", "Maya", notes="weekly #food")
+        service.add_transaction(cycle["id"], "2026-10-02", 500, "-promo", "Wants", "GoTyme", notes="=SUM(A1)")
+        service.add_transaction(cycle["id"], "2026-10-03", 750.5, "Save", "Savings", "Cash", target_account_id=account["id"])
+        txs = service.list_transactions(cycle["id"])
+        text = transactions_to_csv(txs, {account["id"]: "GoTyme"})
+        lines = text.strip().split("\n")
+        assert lines[0] == "Date,Amount,Description,Bucket,Category,Payment Channel,Target,ID"
+        assert [l.split(",")[0] for l in lines[1:]] == ["2026-10-02", "2026-10-03", "2026-10-05"]  # oldest first
+        assert "'=SUM(A1)" in text and "'-promo" in text and ",750.50," in text and ",GoTyme," in text
+        back = parse_bank_csv(text)["rows"]
+        assert [(r["date"].isoformat(), r["amount"], r["bucket"], r["category"], r["payment_channel"]) for r in back] == [
+            ("2026-10-02", 500, "Wants", "-promo", "GoTyme"), ("2026-10-03", 750.5, "Savings", "Save", "Cash"),
+            ("2026-10-05", 2000, "Needs", "Groceries", "Maya")]
+        assert back[0]["description"] == "=SUM(A1)"
+        assert transactions_to_csv([]).strip() == "Date,Amount,Description,Bucket,Category,Payment Channel,Target,ID"
+
+
+def test_find_possible_duplicates_matches_date_and_amount():
+    existing = [{"date": "2026-10-27", "amount": 549.0}]
+    rows = [{"date": date(2026, 10, 27), "amount": 549}, {"date": date(2026, 10, 28), "amount": 549},
+            {"date": date(2026, 10, 27), "amount": None}, {"date": None, "amount": 549}]
+    assert find_possible_duplicates(rows, existing) == [True, False, False, False]
+
+
+# -------------------------------------------------------------- CSV import
+def _row(**kw):
+    base = {"date": date(2026, 10, 5), "amount": 100, "category": "Misc", "bucket": "Needs",
+            "payment_channel": "", "target_account_id": None, "notes": "from bank"}
+    return {**base, **kw}
+
+
+def test_import_transactions_commits_one_batch_with_correct_balances():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        db.logger.clear()
+        result = service.import_transactions(cycle["id"], [
+            _row(amount=500), _row(amount=200, bucket="Savings", target_account_id=account["id"]),
+            _row(amount=300, bucket="Savings", target_account_id=account["id"]),
+            _row(amount=400, bucket="Debt", target_account_id=debt["id"], payment_channel="GoTyme"),
+            _row(amount=1000, bucket="Income", target_account_id="ignored")], default_channel="Maya")
+        assert result["imported"] == 5 and result["total"] == 2400
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1500
+        assert db.get(DEBTS, debt["id"])["remaining_balance"] == 7600
+        stored = service.list_transactions(cycle["id"])
+        assert {t["payment_channel"] for t in stored} == {"Maya", "GoTyme"} and all(t["notes"] == "from bank" for t in stored)
+        assert [t for t in stored if t["bucket"] == "Income"][0]["target_account_id"] is None
+        assert len([e for e in db.logger.recent() if e["operation"].startswith("BATCH")]) == 1
+
+
+def test_import_transactions_chunks_batches_without_splitting_a_transaction():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        rows = [_row(amount=100, bucket="Savings", target_account_id=account["id"]) for _ in range(12)]
+        db.logger.clear()
+        result = service.import_transactions(cycle["id"], rows, chunk_ops=10)  # 2 ops per row -> 5 rows per batch
+        batches = [e for e in db.logger.recent() if e["operation"].startswith("BATCH")]
+        assert result["imported"] == 12 and len(batches) == 3 and max(b["result_count"] for b in batches) <= 10
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 2200
+        assert len(db.query(TRANSACTIONS)) == 12
+
+
+def test_import_transactions_rejects_the_whole_file_if_any_row_is_bad():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        with pytest.raises(ValidationError) as err:
+            service.import_transactions(cycle["id"], [
+                _row(), _row(amount=0), _row(date=None), _row(bucket="Savings"),
+                _row(amount=9000, bucket="Debt", target_account_id=debt["id"]), _row(category="")])
+        message = str(err.value)
+        assert all(f"Row {n}" in message for n in (2, 3, 4, 5, 6)) and "Row 1" not in message
+        assert db.query(TRANSACTIONS) == []
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1000
+        assert db.get(DEBTS, debt["id"])["remaining_balance"] == 8000
+        with pytest.raises(ValidationError) as many:
+            service.import_transactions(cycle["id"], [_row(amount=0)] * 12)
+        assert "+2 more" in str(many.value)
+        for bad_rows, cid in (([], cycle["id"]), ([_row()], "no-cycle")):
+            with pytest.raises(ValidationError):
+                service.import_transactions(cid, bad_rows)
+
+
+def test_csv_import_end_to_end_flags_a_second_import_as_duplicates():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        rows = parse_bank_csv(STANDARD_CSV)["rows"]
+        assert find_possible_duplicates(rows, service.list_transactions(cycle["id"])) == [False] * 4
+        service.import_transactions(cycle["id"], [{**r, "notes": r["description"]} for r in rows], "GoTyme")
+        assert find_possible_duplicates(rows, service.list_transactions(cycle["id"])) == [True] * 4
+        assert collect_tags(service.list_transactions(cycle["id"])) == {}
+
+
+def test_ui_state_prefixes_cover_the_v1_2_widgets():
+    state = {"split_total_0": 1, "split_gen": 2, "imp_file_0": 3, "imp_gen": 1, "ana_tags": [], "sweep_account": "x",
+             "tx_split": True, "keep_me": 1}
+    assert sorted(clear_ui_state(state)) == ["ana_tags", "imp_file_0", "imp_gen", "split_gen", "split_total_0",
+                                             "sweep_account", "tx_split"]
+    assert state == {"keep_me": 1}

@@ -7,7 +7,9 @@ commits every multi-document change as one atomic batch write.
 from __future__ import annotations
 
 import calendar
+import io
 import math
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -17,12 +19,20 @@ from .models import (
     BUCKETS,
     INCOME_BUCKET,
     LINKED_BUCKETS,
+    LOG_BUCKETS,
+    MAX_BATCH_OPS,
+    MAX_SPLIT_PARTS,
+    PAYMENT_CHANNELS,
+    SPEND_BUCKETS,
+    SWEEP_CATEGORY,
     Debt,
     IncomeCycle,
     RecurringTemplate,
     SavingsAccount,
+    SplitPart,
     Transaction,
     ValidationError,
+    new_id,
 )
 
 NEEDS_PCT, WANTS_PCT = 0.50, 0.30  # the remaining 20% is savings & debt repayment
@@ -31,7 +41,8 @@ SEED_PREFIX = "seed-"
 PH_FINAL_WITHHOLDING_TAX = 0.20  # 20% final withholding tax on Philippine bank deposit interest
 WIPE_BATCH_SIZE = 400  # Firestore allows at most 500 writes per batch; stay safely under it
 # st.session_state key prefixes owned by the UI forms; cleared when all data is wiped.
-UI_STATE_PREFIXES = ("rec_", "topup_", "new_cycle_", "cycle_edit_", "wipe_")
+UI_STATE_PREFIXES = ("rec_", "topup_", "new_cycle_", "cycle_edit_", "wipe_",
+                     "split_", "imp_", "ana_", "sweep_", "tx_")
 
 # v1.1 collection. firebase_client.COLLECTIONS doubles as a whitelist inside LocalMockFirestore
 # (_load / reset / snapshot), so without this guard the mock would silently drop the new
@@ -97,23 +108,28 @@ def summarize_cycle(cycle: dict, transactions: list[dict]) -> dict[str, Any]:
     """Compare logged spending with the 50/30/20 caps for one pay cycle."""
     spent = {bucket: 0.0 for bucket in BUCKETS}
     other_income = 0.0
+    swept = 0.0  # rollover sweeps into savings (v1.2): in "Savings" totals, but not in the 20% cap line
     for tx in transactions:
         if tx["bucket"] in spent:
             spent[tx["bucket"]] += tx["amount"]
+            if is_sweep_transaction(tx):
+                swept += tx["amount"]
         elif tx["bucket"] == INCOME_BUCKET:
             other_income += tx["amount"]
     spent = {k: round(v, 2) for k, v in spent.items()}
+    swept = round(swept, 2)
     total = round(sum(spent.values()), 2)
     return {
         "spent": spent,
         "lines": {
             "Needs": _line(spent["Needs"], cycle["needs_cap"]),
             "Wants": _line(spent["Wants"], cycle["wants_cap"]),
-            "Savings & Debt": _line(spent["Savings"] + spent["Debt"], cycle["savings_debt_cap"]),
+            "Savings & Debt": _line(spent["Savings"] + spent["Debt"] - swept, cycle["savings_debt_cap"]),
         },
         "total_allocated": total,
         "unallocated": round(cycle["net_salary"] - total, 2),
         "other_income": round(other_income, 2),
+        "swept": swept,
     }
 
 
@@ -173,6 +189,395 @@ def portfolio_interest_projection(accounts: list[dict]) -> dict[str, float]:
         for key, value in proj.items():
             total[key] += value
     return total
+
+
+# ------------------------------------------------ v1.2: hashtags & analytics
+_HASHTAG_RE = re.compile(r"(?<![\w#&/])#([^\W_]+(?:[-_][^\W_]+)*)")
+
+
+def extract_hashtags(text: Any) -> list[str]:
+    """Hashtags in ``text`` as lowercase tags without the '#', de-duplicated, in order of appearance.
+
+    A tag is letters/digits joined by single '-' or '_' (``#pc-build``, ``#vacation``) and must
+    contain a letter, so ``#1`` is ignored; ``C#``, ``page#top`` and ``##x`` are not tags.
+    """
+    if not text:
+        return []
+    found: dict[str, None] = {}
+    for match in _HASHTAG_RE.finditer(str(text)):
+        tag = match.group(1).lower()
+        if any(ch.isalpha() for ch in tag):
+            found.setdefault(tag, None)
+    return list(found)
+
+
+def _norm_tags(tags: Any) -> list[str]:
+    return [str(t).strip().lstrip("#").lower() for t in (tags or []) if str(t).strip().lstrip("#")]
+
+
+def collect_tags(transactions: list[dict]) -> dict[str, int]:
+    """``{tag: number of transactions using it}``, most used first (ties alphabetical)."""
+    counts: dict[str, int] = {}
+    for tx in transactions:
+        for tag in extract_hashtags(tx.get("notes")):
+            counts[tag] = counts.get(tag, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def filter_by_tags(transactions: list[dict], tags: Any, match_all: bool = False) -> list[dict]:
+    """Keep transactions whose notes contain any (or, with ``match_all``, every) given tag."""
+    wanted = _norm_tags(tags)
+    if not wanted:
+        return list(transactions)
+    check = all if match_all else any
+    return [tx for tx in transactions
+            if check(tag in set(extract_hashtags(tx.get("notes"))) for tag in wanted)]
+
+
+def is_sweep_transaction(tx: dict) -> bool:
+    """True for the grouped Savings transaction created by :func:`sweep_unspent_to_savings`."""
+    return (tx.get("bucket") == "Savings"
+            and str(tx.get("category", "")).strip().lower() == SWEEP_CATEGORY.lower())
+
+
+def tag_totals(transactions: list[dict]) -> list[dict]:
+    """Per-tag ``{tag, count, amount}``, biggest first. Income and sweeps are excluded; a
+    transaction with several tags counts towards each of them."""
+    totals: dict[str, dict] = {}
+    for tx in transactions:
+        if tx["bucket"] == INCOME_BUCKET or is_sweep_transaction(tx):
+            continue
+        for tag in extract_hashtags(tx.get("notes")):
+            row = totals.setdefault(tag, {"tag": tag, "count": 0, "amount": 0.0})
+            row["count"] += 1
+            row["amount"] += tx["amount"]
+    rows = [{**r, "amount": round(r["amount"], 2)} for r in totals.values()]
+    return sorted(rows, key=lambda r: (-r["amount"], r["tag"]))
+
+
+def asset_allocation(accounts: list[dict]) -> list[dict]:
+    """Savings accounts with a positive balance as ``{account, balance, share}`` (share in %)."""
+    held = [a for a in accounts if a["current_balance"] > 0]
+    total = sum(a["current_balance"] for a in held)
+    return [{
+        "account": f"{a['bank_name']} - {a['goal_name']}" if a.get("goal_name") else a["bank_name"],
+        "balance": round(a["current_balance"], 2),
+        "share": round(a["current_balance"] / total * 100, 2),
+    } for a in held]
+
+
+def _check_buckets(buckets: Any) -> tuple:
+    chosen = tuple(buckets)
+    for bucket in chosen:
+        if bucket not in BUCKETS:
+            raise ValidationError(f"Bucket must be one of: {', '.join(BUCKETS)}.")
+    return chosen
+
+
+def _cycle_bounds(cycle: dict) -> tuple[date, date]:
+    return date.fromisoformat(cycle["start_date"]), date.fromisoformat(cycle["end_date"])
+
+
+def daily_spend_series(cycle: dict, transactions: list[dict], buckets: Any = SPEND_BUCKETS) -> list[dict]:
+    """One ``{date, bucket, amount}`` row per day of the cycle per bucket (zero-filled).
+
+    Transactions dated outside the cycle and rollover sweeps are ignored.
+    """
+    chosen = _check_buckets(buckets)
+    start, end = _cycle_bounds(cycle)
+    totals: dict[tuple, float] = {}
+    for tx in transactions:
+        if tx["bucket"] not in chosen or is_sweep_transaction(tx):
+            continue
+        if start <= date.fromisoformat(tx["date"]) <= end:
+            key = (tx["date"], tx["bucket"])
+            totals[key] = totals.get(key, 0.0) + tx["amount"]
+    days = [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+    return [{"date": day, "bucket": b, "amount": round(totals.get((day, b), 0.0), 2)}
+            for day in days for b in chosen]
+
+
+def pacing_summary(cycle: dict, transactions: list[dict], today: Optional[date] = None,
+                   buckets: Any = SPEND_BUCKETS) -> dict[str, Any]:
+    """Compare spending so far with an even daily pace through the cycle.
+
+    Target = the chosen buckets' caps spread evenly over the cycle's days (Savings and Debt share
+    one 20% cap). ``variance`` is target-to-date minus spent, so positive means under pace.
+    """
+    chosen = _check_buckets(buckets)
+    start, end = _cycle_bounds(cycle)
+    today = _to_date(today) if today else date.today()
+    days_total = (end - start).days + 1
+    days_elapsed = max(0, min(days_total, (today - start).days + 1))
+    spent, outside = 0.0, 0
+    for tx in transactions:
+        if tx["bucket"] not in chosen or is_sweep_transaction(tx):
+            continue
+        if start <= date.fromisoformat(tx["date"]) <= end:
+            spent += tx["amount"]
+        else:
+            outside += 1
+    target_total = 0.0
+    if "Needs" in chosen:
+        target_total += cycle["needs_cap"]
+    if "Wants" in chosen:
+        target_total += cycle["wants_cap"]
+    if "Savings" in chosen or "Debt" in chosen:
+        target_total += cycle["savings_debt_cap"]
+    per_day = target_total / days_total
+    target_to_date = round(per_day * days_elapsed, 2)
+    spent = round(spent, 2)
+    return {
+        "days_total": days_total,
+        "days_elapsed": days_elapsed,
+        "spent": spent,
+        "target_total": round(target_total, 2),
+        "target_per_day": round(per_day, 2),
+        "target_to_date": target_to_date,
+        "variance": round(target_to_date - spent, 2),
+        "projected_total": round(spent / days_elapsed * days_total, 2) if days_elapsed else spent,
+        "on_track": spent <= target_to_date,
+        "outside_range": outside,
+    }
+
+
+def unspent_capacity(cycle: dict, transactions: list[dict]) -> dict[str, float]:
+    """Unspent Needs and Wants capacity and what a sweep could still move into savings.
+
+    A bucket that is over its cap counts as 0 (it does not reduce the other bucket's surplus).
+    Amounts already swept are subtracted so a second sweep cannot move the same money twice.
+    """
+    summary = summarize_cycle(cycle, transactions)
+    needs = max(0.0, summary["lines"]["Needs"]["remaining"])
+    wants = max(0.0, summary["lines"]["Wants"]["remaining"])
+    total = round(needs + wants, 2)
+    return {
+        "needs": round(needs, 2),
+        "wants": round(wants, 2),
+        "total": total,
+        "already_swept": summary["swept"],
+        "sweepable": round(max(0.0, total - summary["swept"]), 2),
+    }
+
+
+# ----------------------------------------------------- v1.2: CSV export / import
+CSV_COLUMNS = ("Date", "Amount", "Description", "Bucket", "Category", "Payment Channel", "Target", "ID")
+_FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
+_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%d %b %Y", "%d %B %Y",
+                 "%d-%b-%Y", "%d-%b-%y")
+_MONTH_FIRST = ("%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y")
+_DAY_FIRST = ("%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y")
+_COLUMN_ALIASES = {
+    "date": ("date", "transactiondate", "postingdate", "txndate", "transdate", "valuedate", "datetime"),
+    "amount": ("amount", "amt", "transactionamount", "value"),
+    "debit": ("debit", "withdrawal", "withdrawals", "moneyout", "dr"),
+    "credit": ("credit", "deposit", "deposits", "moneyin", "cr"),
+    "description": ("description", "details", "particulars", "narration", "memo", "merchant",
+                    "transactiondetails", "remarks", "reference"),
+    "bucket": ("bucket",),
+    "category": ("category",),
+    "channel": ("paymentchannel", "channel"),
+}
+# Suggestions only: every imported row is reviewed and re-mapped in the preview table.
+_INCOME_WORDS = ("salary", "payroll", "bonus", "refund", "interest earned", "cashback")
+_NEEDS_WORDS = ("meralco", "maynilad", "manila water", "water district", "pldt", "converge", "rent",
+                "grocery", "supermarket", "puregold", "mercury drug", "pharmacy", "tuition",
+                "insurance", "petron", "shell", "caltex", "beep", "lrt", "mrt")
+_WANTS_WORDS = ("netflix", "spotify", "youtube", "disney", "steam", "playstation", "xbox", "lazada",
+                "shopee", "jollibee", "mcdonald", "starbucks", "grabfood", "foodpanda", "cinema", "movie")
+
+
+def _csv_safe(value: Any) -> str:
+    """Neutralise spreadsheet formula injection in exported text cells."""
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_FORMULA_CHARS) else text
+
+
+def _csv_unsafe(value: Any) -> str:
+    text = "" if value is None else str(value).strip()
+    return text[1:] if len(text) > 1 and text[0] == "'" and text[1] in "=+-@" else text
+
+
+def transactions_to_csv(transactions: list[dict], names: Optional[dict[str, str]] = None) -> str:
+    """CSV text (header always present) of transactions, oldest first.
+
+    ``names`` maps a savings-account / debt id to a readable name for the Target column.
+    Description is the notes, or the category when there are none, so the file re-imports cleanly.
+    """
+    import pandas as pd
+
+    names = names or {}
+    rows = [{
+        "Date": t["date"],
+        "Amount": f"{t['amount']:.2f}",
+        "Description": _csv_safe(t.get("notes") or t["category"]),
+        "Bucket": t["bucket"],
+        "Category": _csv_safe(t["category"]),
+        "Payment Channel": t["payment_channel"],
+        "Target": _csv_safe(names.get(t.get("target_account_id") or "", "")),
+        "ID": t["id"],
+    } for t in sorted(transactions, key=lambda t: (t["date"], t.get("created_at", "")))]
+    return pd.DataFrame(rows, columns=list(CSV_COLUMNS)).to_csv(index=False, lineterminator="\n")
+
+
+def parse_amount(value: Any) -> float:
+    """Read a bank amount: ``1,250.00``, ``-1250``, ``(1,250.00)``, ``₱1,250.00``, ``1250 DR``.
+
+    Debits (negative, parentheses, trailing ``-`` or ``DR``) are returned negative.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text:
+        raise ValidationError("Amount is empty.")
+    negative = False
+    if text.startswith("(") and text.endswith(")"):
+        negative, text = True, text[1:-1]
+    suffix = re.search(r"(?i)\s*\b(dr|cr)$", text)
+    if suffix:
+        negative = negative or suffix.group(1).lower() == "dr"
+        text = text[:suffix.start()]
+    text = re.sub(r"(?i)₱|php|,|\s", "", text)
+    if text.endswith("-"):
+        negative, text = True, text[:-1]
+    if text.startswith("+"):
+        text = text[1:]
+    if text.startswith("-"):
+        negative, text = True, text[1:]
+    try:
+        number = float(text)
+    except ValueError:
+        raise ValidationError(f"Cannot read the amount {value!r}.") from None
+    if not math.isfinite(number):
+        raise ValidationError(f"Cannot read the amount {value!r}.")
+    return -abs(number) if negative else abs(number)
+
+
+def parse_date_text(value: Any, dayfirst: bool = False) -> date:
+    """Parse common bank date formats; slash/dash numeric dates are month-first unless ``dayfirst``."""
+    raw = str(value if value is not None else "").strip()
+    if not raw:
+        raise ValidationError("Date is empty.")
+    numeric = _DAY_FIRST + _MONTH_FIRST if dayfirst else _MONTH_FIRST + _DAY_FIRST
+    candidates = [raw, raw.replace("T", " ").split(" ")[0]]
+    for text in candidates:
+        for fmt in _DATE_FORMATS[:2] + numeric + _DATE_FORMATS[2:]:
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+    raise ValidationError(f"Cannot read the date {value!r}.")
+
+
+def suggest_bucket(description: str, amount: Optional[float] = None, has_negative: bool = False) -> str:
+    """Best-guess bucket for a bank row (a suggestion the user can change in the preview).
+
+    In files that mix signs, credits (positive) are income; otherwise income needs a keyword.
+    Unrecognised expenses default to Wants.
+    """
+    text = str(description or "").lower()
+    if has_negative:
+        if amount is not None and amount > 0:
+            return "Income"
+    elif any(word in text for word in _INCOME_WORDS):
+        return "Income"
+    if any(word in text for word in _NEEDS_WORDS):
+        return "Needs"
+    return "Wants"
+
+
+def parse_bank_csv(source: Any, dayfirst: bool = False) -> dict[str, Any]:
+    """Parse a bank CSV (``Date``, ``Amount`` or ``Debit``/``Credit``, ``Description``) into preview rows.
+
+    Returns ``{"rows": [...], "warnings": [...]}``. Each row has ``line, date, amount, description,
+    category, bucket, payment_channel``; ``amount`` is positive, ``date``/``amount`` are ``None``
+    when unreadable (flagged in ``warnings``). ``Bucket``/``Category``/``Payment Channel`` columns,
+    as written by :func:`transactions_to_csv`, pre-fill those fields.
+    """
+    import pandas as pd
+
+    if isinstance(source, (bytes, bytearray)):
+        try:
+            text = bytes(source).decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = bytes(source).decode("cp1252", errors="replace")
+    else:
+        text = str(source).lstrip("\ufeff")
+    if not text.strip():
+        raise ValidationError("The CSV file is empty.")
+    try:
+        frame = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, skipinitialspace=True)
+    except (pd.errors.ParserError, pd.errors.EmptyDataError, ValueError) as exc:
+        raise ValidationError(f"Could not read the CSV: {exc}") from None
+
+    lookup: dict[str, str] = {}
+    for column in frame.columns:
+        lookup.setdefault(re.sub(r"[^a-z]", "", str(column).lower()), column)
+
+    def find(key: str) -> Optional[str]:
+        return next((lookup[a] for a in _COLUMN_ALIASES[key] if a in lookup), None)
+
+    cols = {key: find(key) for key in _COLUMN_ALIASES}
+    found = ", ".join(str(c) for c in frame.columns)
+    if cols["date"] is None:
+        raise ValidationError(f"Could not find a Date column. Columns found: {found}.")
+    if cols["description"] is None:
+        raise ValidationError(f"Could not find a Description column. Columns found: {found}.")
+    if cols["amount"] is None and not (cols["debit"] or cols["credit"]):
+        raise ValidationError(f"Could not find an Amount (or Debit/Credit) column. Columns found: {found}.")
+
+    warnings: list[str] = []
+    raw_rows: list[dict] = []
+    for line, rec in enumerate(frame.to_dict("records"), start=2):
+        if not any(str(v).strip() for v in rec.values()):
+            continue
+        when, signed = None, None
+        try:
+            when = parse_date_text(rec[cols["date"]], dayfirst)
+        except ValidationError as exc:
+            warnings.append(f"Line {line}: {exc}")
+        try:
+            if cols["amount"]:
+                signed = parse_amount(rec[cols["amount"]])
+            else:
+                debit = str(rec.get(cols["debit"], "")).strip() if cols["debit"] else ""
+                credit = str(rec.get(cols["credit"], "")).strip() if cols["credit"] else ""
+                signed = (abs(parse_amount(credit)) if credit else 0.0) - (abs(parse_amount(debit)) if debit else 0.0)
+        except ValidationError as exc:
+            warnings.append(f"Line {line}: {exc}")
+        raw_rows.append({"line": line, "date": when, "signed": signed,
+                         "description": _csv_unsafe(rec[cols["description"]]),
+                         "bucket": str(rec.get(cols["bucket"], "")).strip().title() if cols["bucket"] else "",
+                         "category": _csv_unsafe(rec.get(cols["category"], "")) if cols["category"] else "",
+                         "channel": str(rec.get(cols["channel"], "")).strip() if cols["channel"] else ""})
+    if not raw_rows:
+        raise ValidationError("No transaction rows were found in the CSV.")
+
+    has_negative = any(r["signed"] is not None and r["signed"] < 0 for r in raw_rows)
+    channels = {c.lower(): c for c in PAYMENT_CHANNELS}
+    rows = []
+    for r in raw_rows:
+        rows.append({
+            "line": r["line"],
+            "date": r["date"],
+            "amount": abs(r["signed"]) if r["signed"] is not None else None,
+            "description": r["description"],
+            "category": r["category"] or r["description"][:40] or "Imported",
+            "bucket": r["bucket"] if r["bucket"] in LOG_BUCKETS
+            else suggest_bucket(r["description"], r["signed"], has_negative),
+            "payment_channel": channels.get(r["channel"].lower(), ""),
+        })
+    return {"rows": rows, "warnings": warnings}
+
+
+def find_possible_duplicates(rows: list[dict], existing: list[dict]) -> list[bool]:
+    """Flag rows whose date and amount match an existing transaction (likely already imported)."""
+    seen = {(t["date"], round(t["amount"], 2)) for t in existing}
+    flags = []
+    for row in rows:
+        when, amount = row.get("date"), row.get("amount")
+        key = (when.isoformat() if hasattr(when, "isoformat") else str(when),
+               round(abs(amount), 2) if amount is not None else None)
+        flags.append(key in seen)
+    return flags
 
 
 # ------------------------------------------------------------------ service
@@ -270,25 +675,143 @@ class BudgetService:
             bucket=bucket, payment_channel=payment_channel, notes=notes,
             target_account_id=target_account_id if bucket in LINKED_BUCKETS else None,
         )
-        ops: list[tuple] = [("set", TRANSACTIONS, tx.id, tx.to_dict())]
+        self.db.batch_write(self._plan_tx_ops(tx, {}))
+        return tx.to_dict()
 
+    def _cached(self, cache: dict, collection: str, doc_id: Optional[str], label: str) -> dict:
+        """Working copy of a savings account / debt that accumulates the changes planned so far."""
+        key = (collection, doc_id)
+        if key not in cache:
+            cache[key] = dict(self._require(collection, doc_id, label))
+        return cache[key]
+
+    def _plan_tx_ops(self, tx: Transaction, cache: dict) -> list[tuple]:
+        """Write ops for one transaction: the document plus its savings/debt balance update.
+
+        ``cache`` carries running balances, so several transactions planned into one batch
+        (split / import) accumulate on the same account correctly.
+        """
+        ops: list[tuple] = [("set", TRANSACTIONS, tx.id, tx.to_dict())]
         if tx.bucket == "Savings":
-            account = self._require(SAVINGS_ACCOUNTS, tx.target_account_id, "savings account")
+            account = self._cached(cache, SAVINGS_ACCOUNTS, tx.target_account_id, "savings account")
+            account["current_balance"] = round(account["current_balance"] + tx.amount, 2)
             ops.append(("update", SAVINGS_ACCOUNTS, account["id"],
-                        {"current_balance": round(account["current_balance"] + tx.amount, 2)}))
+                        {"current_balance": account["current_balance"]}))
         elif tx.bucket == "Debt":
-            debt = self._require(DEBTS, tx.target_account_id, "debt")
+            debt = self._cached(cache, DEBTS, tx.target_account_id, "debt")
             if tx.amount > debt["remaining_balance"] + 1e-9:
                 raise ValidationError(
                     f"Payment exceeds the remaining balance of {debt['name']} "
                     f"(₱{debt['remaining_balance']:,.2f}).")
-            remaining = round(debt["remaining_balance"] - tx.amount, 2)
+            debt["remaining_balance"] = round(debt["remaining_balance"] - tx.amount, 2)
+            debt["status"] = "paid" if debt["remaining_balance"] <= 0 else "active"
             ops.append(("update", DEBTS, debt["id"], {
-                "remaining_balance": remaining,
-                "status": "paid" if remaining <= 0 else "active"}))
+                "remaining_balance": debt["remaining_balance"], "status": debt["status"]}))
+        return ops
 
+    def log_split_transaction(self, cycle_id: str, date: Any, payment_channel: str, parts: list,
+                              total_amount: Optional[float] = None, notes: str = "") -> dict:
+        """Log one payment as several transactions (one per part) in a single atomic batch.
+
+        ``parts`` are ``SplitPart`` objects or dicts with ``category, bucket, amount`` (and
+        ``target_account_id`` for Savings/Debt rows). When ``total_amount`` is given the parts must
+        add up to it exactly. All parts share one timestamp and a ``split <id> n/N`` marker in their
+        notes (the user's own notes, hashtags included, are kept on every part).
+        """
+        if self.db.get(INCOME_CYCLES, cycle_id) is None:
+            raise ValidationError("Pay cycle not found.")
+        rows = list(parts)
+        if len(rows) < 2:
+            raise ValidationError("A split needs at least two rows; use the normal form for one.")
+        if len(rows) > MAX_SPLIT_PARTS:
+            raise ValidationError(f"A split can have at most {MAX_SPLIT_PARTS} rows.")
+        clean: list[SplitPart] = []
+        for number, raw in enumerate(rows, start=1):
+            try:
+                clean.append(raw if isinstance(raw, SplitPart) else SplitPart(**raw))
+            except (ValidationError, TypeError) as exc:
+                raise ValidationError(f"Row {number}: {exc}") from None
+        allocated = round(sum(p.amount for p in clean), 2)
+        if total_amount is not None:
+            try:
+                total = round(float(total_amount), 2)
+            except (TypeError, ValueError):
+                raise ValidationError("Total payment amount must be a number.") from None
+            if total <= 0:
+                raise ValidationError("Total payment amount must be greater than 0.")
+            if allocated != total:
+                raise ValidationError(
+                    f"The rows add up to ₱{allocated:,.2f} but the total payment is ₱{total:,.2f} "
+                    f"(difference ₱{abs(total - allocated):,.2f}).")
+        group = new_id()[:8]
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        shared = str(notes or "").strip()
+        cache: dict = {}
+        ops: list[tuple] = []
+        created: list[dict] = []
+        for number, part in enumerate(clean, start=1):
+            marker = f"split {group} {number}/{len(clean)}"
+            tx = Transaction.new(
+                cycle_id=cycle_id, date=date, amount=part.amount, category=part.category,
+                bucket=part.bucket, payment_channel=payment_channel, created_at=stamp,
+                target_account_id=part.target_account_id,
+                notes=f"{shared} | {marker}" if shared else marker)
+            try:
+                ops += self._plan_tx_ops(tx, cache)
+            except ValidationError as exc:
+                raise ValidationError(f"Row {number}: {exc}") from None
+            created.append(tx.to_dict())
         self.db.batch_write(ops)
-        return tx.to_dict()
+        return {"split_id": group, "total": allocated, "transactions": created}
+
+    def import_transactions(self, cycle_id: str, rows: list[dict], default_channel: str = "Other",
+                            chunk_ops: int = MAX_BATCH_OPS) -> dict:
+        """Bulk-create transactions from mapped CSV rows.
+
+        Every row is validated and planned first; if any row is bad nothing is written and the
+        error lists the problem rows. Otherwise the writes are committed in batches of at most
+        ``chunk_ops`` ops, keeping each transaction together with its balance update.
+        Rows: ``date, amount, category, bucket, payment_channel, target_account_id, notes``.
+        """
+        if self.db.get(INCOME_CYCLES, cycle_id) is None:
+            raise ValidationError("Pay cycle not found.")
+        rows = list(rows)
+        if not rows:
+            raise ValidationError("Select at least one row to import.")
+        cache: dict = {}
+        groups: list[list[tuple]] = []
+        created: list[dict] = []
+        errors: list[str] = []
+        for number, row in enumerate(rows, start=1):
+            bucket = row.get("bucket")
+            try:
+                tx = Transaction.new(
+                    cycle_id=cycle_id, date=row.get("date"), amount=row.get("amount"),
+                    category=row.get("category"), bucket=bucket,
+                    payment_channel=row.get("payment_channel") or default_channel,
+                    target_account_id=row.get("target_account_id") if bucket in LINKED_BUCKETS else None,
+                    notes=row.get("notes", ""))
+                groups.append(self._plan_tx_ops(tx, cache))
+                created.append(tx.to_dict())
+            except ValidationError as exc:
+                errors.append(f"Row {number}: {exc}")
+        if errors:
+            more = f" (+{len(errors) - 10} more)" if len(errors) > 10 else ""
+            raise ValidationError("; ".join(errors[:10]) + more)
+        chunk: list[tuple] = []
+        for group in groups:
+            if chunk and len(chunk) + len(group) > chunk_ops:
+                self.db.batch_write(chunk)
+                chunk = []
+            chunk.extend(group)
+        if chunk:
+            self.db.batch_write(chunk)
+        return {"imported": len(created), "total": round(sum(t["amount"] for t in created), 2),
+                "transactions": created}
+
+    def sweep_unspent_to_savings(self, cycle_id: str, target_account_id: str,
+                                 today: Optional[date] = None) -> dict:
+        return sweep_unspent_to_savings(self.db, cycle_id, target_account_id, today)
 
     def delete_transaction(self, tx_id: str) -> None:
         """Delete a transaction and reverse its savings/debt balance effect."""
@@ -556,3 +1079,35 @@ def clear_ui_state(state: Any, prefixes: tuple = UI_STATE_PREFIXES) -> list[str]
     for key in doomed:
         del state[key]
     return doomed
+
+
+# ------------------------------------------------- v1.2 module-level functions
+def sweep_unspent_to_savings(db, cycle_id: str, target_account_id: str,
+                             today: Optional[date] = None) -> dict:
+    """Move the cycle's unspent Needs + Wants capacity into a savings account.
+
+    Creates ONE grouped ``Savings`` transaction (category "Rollover sweep", dated ``today`` clamped
+    into the cycle) and raises the account's balance in the same atomic batch. Overspent buckets
+    contribute 0, and anything already swept is subtracted, so repeating it cannot move the same
+    money twice. Sweeps are excluded from the 20% Savings & Debt cap line (they are rollover, not
+    planned savings). Delete the transaction to undo; the balance is reversed.
+    """
+    cycle = db.get(INCOME_CYCLES, cycle_id)
+    if cycle is None:
+        raise ValidationError("Pay cycle not found.")
+    if not target_account_id or db.get(SAVINGS_ACCOUNTS, target_account_id) is None:
+        raise ValidationError("Select a savings account to sweep into.")
+    service = BudgetService(db)
+    info = unspent_capacity(cycle, service.list_transactions(cycle_id=cycle_id))
+    if info["sweepable"] <= 0:
+        raise ValidationError("Nothing to sweep: there is no unspent Needs or Wants capacity left in this cycle.")
+    start, end = _cycle_bounds(cycle)
+    sweep_on = min(max(_to_date(today) if today else date.today(), start), end)
+    notes = f"Rollover sweep of unspent Needs ₱{info['needs']:,.2f} + Wants ₱{info['wants']:,.2f}"
+    if info["already_swept"]:
+        notes += f", less ₱{info['already_swept']:,.2f} already swept"
+    tx = log_transaction(db, cycle_id, sweep_on, info["sweepable"], SWEEP_CATEGORY, "Savings", "Other",
+                         target_account_id=target_account_id, notes=f"{notes} #rollover")
+    return {"amount": info["sweepable"], "needs": info["needs"], "wants": info["wants"],
+            "already_swept": info["already_swept"], "transaction": tx,
+            "account": db.get(SAVINGS_ACCOUNTS, target_account_id)}
