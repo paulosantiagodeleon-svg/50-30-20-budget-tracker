@@ -1,0 +1,8 @@
+# Dark-mode theme for the 50/30/20 tracker.
+# Streamlit reads this file at startup, so restart `streamlit run app.py` after editing it.
+[theme]
+base = "dark"
+primaryColor = "#4F46E5"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#1E293B"
+font = "sans serif"

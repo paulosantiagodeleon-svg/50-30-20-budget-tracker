@@ -7,6 +7,7 @@ commits every multi-document change as one atomic batch write.
 from __future__ import annotations
 
 import calendar
+import inspect
 import io
 import math
 import re
@@ -38,11 +39,13 @@ from .models import (
 NEEDS_PCT, WANTS_PCT = 0.50, 0.30  # the remaining 20% is savings & debt repayment
 FREQUENCIES = ("Monthly", "Bi-weekly")
 SEED_PREFIX = "seed-"
+UPCOMING_BILLS_DAYS = 7  # look-ahead for the Dashboard "Upcoming Bills" alert (v1.2.1)
+BILL_POSTED_WINDOW_DAYS = 10  # a bill posted this close to its due date counts as already paid
 PH_FINAL_WITHHOLDING_TAX = 0.20  # 20% final withholding tax on Philippine bank deposit interest
 WIPE_BATCH_SIZE = 400  # Firestore allows at most 500 writes per batch; stay safely under it
 # st.session_state key prefixes owned by the UI forms; cleared when all data is wiped.
 UI_STATE_PREFIXES = ("rec_", "topup_", "new_cycle_", "cycle_edit_", "wipe_",
-                     "split_", "imp_", "ana_", "sweep_", "tx_")
+                     "split_", "imp_", "ana_", "sweep_", "tx_", "qa_")
 
 # v1.1 collection. firebase_client.COLLECTIONS doubles as a whitelist inside LocalMockFirestore
 # (_load / reset / snapshot), so without this guard the mock would silently drop the new
@@ -580,6 +583,78 @@ def find_possible_duplicates(rows: list[dict], existing: list[dict]) -> list[boo
     return flags
 
 
+# ------------------------------------------------ v1.2.1: bills alert & UI helpers
+def due_label(days_until: int) -> str:
+    """'today', 'tomorrow' or 'in N days' for a number of days until a due date."""
+    if days_until <= 0:
+        return "today"
+    return "tomorrow" if days_until == 1 else f"in {days_until} days"
+
+
+def _bill_posted_for(template: dict, due: date, transactions: list[dict]) -> bool:
+    """True if ``post_recurring_templates`` already logged this template for the ``due`` occurrence.
+
+    Matches the "Recurring: <name>" note it writes, dated within ``BILL_POSTED_WINDOW_DAYS`` of the
+    due date (monthly bills are ~30 days apart, so last month's posting never matches). Edited notes
+    simply fail to match, which keeps the bill visible rather than hiding it by mistake.
+    """
+    marker = f"Recurring: {template['name']}".strip().lower()
+    for tx in transactions:
+        if str(tx.get("notes", "")).strip().lower() != marker:
+            continue
+        try:
+            posted = date.fromisoformat(tx["date"])
+        except (KeyError, ValueError):
+            continue
+        if abs((due - posted).days) <= BILL_POSTED_WINDOW_DAYS:
+            return True
+    return False
+
+
+def upcoming_bills(templates: list[dict], today: Optional[date] = None, days: int = UPCOMING_BILLS_DAYS,
+                   transactions: Optional[list[dict]] = None) -> list[dict]:
+    """Recurring bills falling due within the next ``days`` days (today included), soonest first.
+
+    Each row is the template plus ``due_date`` (ISO) and ``days_until``. Income templates are not
+    bills and are skipped; short months clamp the due day to their last day. When ``transactions``
+    is given, bills already posted for that due date are left out.
+    """
+    if days < 0:
+        raise ValidationError("Days ahead cannot be negative.")
+    today = _to_date(today) if today else date.today()
+    rows = []
+    for tpl in templates:
+        if tpl.get("bucket") == INCOME_BUCKET:
+            continue
+        due = next_due_date(tpl["due_day"], today)
+        until = (due - today).days
+        if until > days:
+            continue
+        if transactions is not None and _bill_posted_for(tpl, due, transactions):
+            continue
+        rows.append({**tpl, "due_date": due.isoformat(), "days_until": until})
+    return sorted(rows, key=lambda r: (r["days_until"], r["name"].lower()))
+
+
+def stretch_width_kwargs(func: Any) -> dict:
+    """Keyword args that make a Streamlit widget fill its container, whatever the Streamlit version.
+
+    ``use_container_width=True`` is deprecated in favour of ``width="stretch"``; this inspects the
+    widget and returns whichever its installed Streamlit supports (``{}`` when it already stretches
+    by default, as ``st.dataframe`` / ``st.data_editor`` do in current releases).
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return {}
+    width = params.get("width")
+    if width is not None and isinstance(width.default, str):  # new API: "content" | "stretch" | int
+        return {} if width.default == "stretch" else {"width": "stretch"}
+    if "use_container_width" in params:
+        return {"use_container_width": True}
+    return {}
+
+
 # ------------------------------------------------------------------ service
 class BudgetService:
     def __init__(self, db) -> None:
@@ -812,6 +887,11 @@ class BudgetService:
     def sweep_unspent_to_savings(self, cycle_id: str, target_account_id: str,
                                  today: Optional[date] = None) -> dict:
         return sweep_unspent_to_savings(self.db, cycle_id, target_account_id, today)
+
+    def quick_add_expense(self, cycle_id: str, amount: float, category: str, bucket: str = "Needs",
+                          payment_channel: str = "Cash", notes: str = "",
+                          today: Optional[date] = None) -> dict:
+        return quick_add_expense(self.db, cycle_id, amount, category, bucket, payment_channel, notes, today)
 
     def delete_transaction(self, tx_id: str) -> None:
         """Delete a transaction and reverse its savings/debt balance effect."""
@@ -1111,3 +1191,15 @@ def sweep_unspent_to_savings(db, cycle_id: str, target_account_id: str,
     return {"amount": info["sweepable"], "needs": info["needs"], "wants": info["wants"],
             "already_swept": info["already_swept"], "transaction": tx,
             "account": db.get(SAVINGS_ACCOUNTS, target_account_id)}
+
+
+# ------------------------------------------------- v1.2.1 module-level functions
+def quick_add_expense(db, cycle_id: str, amount: float, category: str, bucket: str = "Needs",
+                      payment_channel: str = "Cash", notes: str = "",
+                      today: Optional[date] = None) -> dict:
+    """Log a daily expense dated today. Restricted to the Needs and Wants buckets; anything that
+    touches savings or debt goes through the full transaction form."""
+    if bucket not in SPEND_BUCKETS:
+        raise ValidationError(f"Quick add is for {' and '.join(SPEND_BUCKETS)} only.")
+    when = _to_date(today) if today else date.today()
+    return log_transaction(db, cycle_id, when, amount, category, bucket, payment_channel, notes=notes)

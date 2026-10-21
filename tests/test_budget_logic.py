@@ -54,6 +54,13 @@ from src.services import (  # v1.2 additions
     transactions_to_csv,
     unspent_capacity,
 )
+from src.services import (  # v1.2.1 additions
+    UPCOMING_BILLS_DAYS,
+    due_label,
+    quick_add_expense,
+    stretch_width_kwargs,
+    upcoming_bills,
+)
 
 
 def make_service(tmp: str):
@@ -1173,4 +1180,137 @@ def test_ui_state_prefixes_cover_the_v1_2_widgets():
              "tx_split": True, "keep_me": 1}
     assert sorted(clear_ui_state(state)) == ["ana_tags", "imp_file_0", "imp_gen", "split_gen", "split_total_0",
                                              "sweep_account", "tx_split"]
+    assert state == {"keep_me": 1}
+
+
+# =====================================================================  v1.2.1
+def _bill(name, due_day, amount=1000, bucket="Needs", **extra):
+    return {"id": f"tpl-{name}", "name": name, "amount": amount, "category": name, "bucket": bucket,
+            "payment_channel": "Cash", "target_account_id": None, "due_day": due_day, **extra}
+
+
+def _posted(day, notes):
+    return {"date": day, "notes": notes, "amount": 1, "bucket": "Needs", "category": "x"}
+
+
+# ------------------------------------------------------- upcoming-bills alert
+def test_due_label_wording():
+    assert [due_label(n) for n in (-3, 0, 1, 2, 7)] == ["today", "today", "tomorrow", "in 2 days", "in 7 days"]
+
+
+def test_upcoming_bills_lists_what_is_due_within_a_week_soonest_first():
+    templates = [_bill("Meralco", 25), _bill("Water", 22), _bill("Fiber", 15),
+                 _bill("Auto-Save", 28, bucket="Savings", target_account_id="acct"),
+                 _bill("Salary", 25, bucket="Income"), _bill("Too far", 29)]
+    rows = upcoming_bills(templates, date(2026, 10, 21))
+    assert UPCOMING_BILLS_DAYS == 7
+    assert [r["name"] for r in rows] == ["Water", "Meralco", "Auto-Save"]  # Fiber passed, Income skipped, 29th is 8 days out
+    assert [(r["days_until"], r["due_date"]) for r in rows] == [(1, "2026-10-22"), (4, "2026-10-25"), (7, "2026-10-28")]
+    assert rows[0]["id"] == "tpl-Water" and rows[0]["amount"] == 1000
+    assert "due_date" not in templates[1]  # the input templates are not modified
+    assert upcoming_bills(templates, "2026-10-21") == rows  # ISO strings work too
+    assert upcoming_bills([], date(2026, 10, 21)) == []
+
+
+def test_upcoming_bills_window_boundaries_and_sorting():
+    templates = [_bill("b-bill", 21), _bill("A-bill", 21), _bill("Next week", 28), _bill("Later", 29)]
+    today = date(2026, 10, 21)
+    assert [(r["name"], r["days_until"]) for r in upcoming_bills(templates, today, days=0)] == [
+        ("A-bill", 0), ("b-bill", 0)]  # due today counts; ties sort by name, ignoring case
+    assert [r["name"] for r in upcoming_bills(templates, today)] == ["A-bill", "b-bill", "Next week"]
+    assert len(upcoming_bills(templates, today, days=30)) == 4
+    with pytest.raises(ValidationError):
+        upcoming_bills(templates, today, days=-1)
+
+
+def test_upcoming_bills_handle_short_months_and_year_end():
+    assert upcoming_bills([_bill("Rent", 3)], date(2026, 12, 28))[0]["due_date"] == "2027-01-03"
+    feb = upcoming_bills([_bill("Late", 31), _bill("Thirty", 30)], date(2027, 2, 25))
+    assert [(r["due_date"], r["days_until"]) for r in feb] == [("2027-02-28", 3), ("2027-02-28", 3)]
+    assert upcoming_bills([_bill("Last day", 31)], date(2027, 1, 31))[0]["days_until"] == 0
+
+
+def test_upcoming_bills_skip_bills_already_posted_when_transactions_are_given():
+    templates, today = [_bill("Meralco", 25)], date(2026, 10, 21)  # next due Oct 25
+    assert upcoming_bills(templates, today, transactions=[]) != []
+    assert upcoming_bills(templates, today, transactions=None) != []
+    for posted in ("2026-10-15", "2026-10-25", "2026-10-28"):  # early, on time and a little late
+        assert upcoming_bills(templates, today, transactions=[_posted(posted, "Recurring: Meralco")]) == [], posted
+    assert upcoming_bills(templates, today, transactions=[_posted("2026-10-20", "RECURRING: meralco")]) == []
+    for still_due in (_posted("2026-10-10", "Recurring: Meralco"),            # 15 days away: another month's
+                      _posted("2026-09-25", "Recurring: Meralco"),            # last month's payment
+                      _posted("2026-10-20", "Recurring: Meralco #edited"),   # edited note: stay visible
+                      _posted("2026-10-20", "Recurring: Meralco Plus"),      # a different bill
+                      {"notes": "Recurring: Meralco"}, _posted("not-a-date", "Recurring: Meralco")):
+        assert len(upcoming_bills(templates, today, transactions=[still_due])) == 1, still_due
+
+
+def test_upcoming_bills_end_to_end_with_posting_through_the_service():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        tpl = service.create_recurring_template("Meralco", 3200, "Electricity", "Needs", "Maya", 25)
+        today = date(2026, 10, 21)
+        assert [b["name"] for b in upcoming_bills(service.list_recurring_templates(), today)] == ["Meralco"]
+        service.post_recurring_templates(cycle["id"], [tpl["id"]], "2026-10-20")
+        txs = service.list_transactions(cycle["id"])
+        assert upcoming_bills(service.list_recurring_templates(), today, transactions=txs) == []
+        assert len(upcoming_bills(service.list_recurring_templates(), today)) == 1  # no transactions given: still listed
+
+
+# ------------------------------------------------------------- quick add
+def test_quick_add_expense_logs_a_dated_needs_or_wants_transaction():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        tx = quick_add_expense(db, cycle["id"], 85.5, "Commute/Fare", today=date(2026, 10, 12))
+        assert (tx["bucket"], tx["date"], tx["payment_channel"], tx["amount"], tx["category"]) == (
+            "Needs", "2026-10-12", "Cash", 85.5, "Commute/Fare")
+        wants = service.quick_add_expense(cycle["id"], 120, " Coffee ", "Wants", "Maya", "iced #treat", date(2026, 10, 13))
+        assert (wants["category"], wants["notes"], wants["payment_channel"]) == ("Coffee", "iced #treat", "Maya")
+        spent = service.cycle_summary(db.get("income_cycles", cycle["id"]))["spent"]
+        assert spent["Needs"] == 85.5 and spent["Wants"] == 120
+        assert collect_tags(service.list_transactions(cycle["id"])) == {"treat": 1}
+        assert quick_add_expense(db, cycle["id"], 10, "Lunch")["date"] == date.today().isoformat()
+
+
+def test_quick_add_is_limited_to_needs_and_wants_and_validates_input():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        for bucket in ("Savings", "Debt", "Income", "Nonsense", None):
+            with pytest.raises(ValidationError) as err:
+                quick_add_expense(db, cycle["id"], 100, "Nope", bucket)
+            assert "Needs and Wants" in str(err.value)
+        for amount in (0, -5, "abc"):
+            with pytest.raises(ValidationError):
+                quick_add_expense(db, cycle["id"], amount, "Lunch")
+        with pytest.raises(ValidationError):
+            quick_add_expense(db, cycle["id"], 50, "   ")
+        with pytest.raises(ValidationError):
+            quick_add_expense(db, "no-cycle", 50, "Lunch")
+        assert db.query(TRANSACTIONS) == []
+        assert db.get(SAVINGS_ACCOUNTS, account["id"])["current_balance"] == 1000
+        assert db.get(DEBTS, debt["id"])["remaining_balance"] == 8000
+
+
+# ------------------------------------------- full-width widgets across Streamlit versions
+def test_stretch_width_kwargs_picks_the_api_the_installed_streamlit_supports():
+    def new_button(label, key=None, *, use_container_width=None, width="content"): ...
+    def new_dataframe(data=None, width="stretch", height="auto", *, use_container_width=None): ...
+    def old_button(label, key=None, *, use_container_width=False): ...
+    def old_dataframe(data=None, width=None, height=None, *, use_container_width=False): ...
+    def ancient(label): ...
+
+    assert stretch_width_kwargs(new_button) == {"width": "stretch"}
+    assert stretch_width_kwargs(new_dataframe) == {}  # already stretches by default
+    assert stretch_width_kwargs(old_button) == {"use_container_width": True}
+    assert stretch_width_kwargs(old_dataframe) == {"use_container_width": True}  # int width: never pass "stretch"
+    assert stretch_width_kwargs(ancient) == {}
+    assert stretch_width_kwargs(object()) == {}  # not introspectable
+
+
+def test_ui_state_prefixes_cover_the_quick_add_widgets():
+    state = {"qa_gen": 1, "qa_category_0": "Lunch", "qa_preset_0": "Lunch", "keep_me": 1}
+    assert sorted(clear_ui_state(state)) == ["qa_category_0", "qa_gen", "qa_preset_0"]
     assert state == {"keep_me": 1}

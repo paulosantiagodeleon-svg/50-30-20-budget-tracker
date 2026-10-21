@@ -15,6 +15,7 @@ from src.models import BUCKETS, LOG_BUCKETS, PAYMENT_CHANNELS, SPEND_BUCKETS, Va
 from src.services import (
     ALL_COLLECTIONS,
     FREQUENCIES,
+    UPCOMING_BILLS_DAYS,
     BudgetService,
     asset_allocation,
     calculate_interest_projection,
@@ -24,19 +25,32 @@ from src.services import (
     daily_spend_series,
     debt_progress,
     default_end_date,
+    due_label,
     filter_by_tags,
     find_possible_duplicates,
     next_due_date,
     pacing_summary,
     parse_bank_csv,
     portfolio_interest_projection,
+    quick_add_expense,
+    stretch_width_kwargs,
+    summarize_cycle,
     tag_totals,
     top_up_cycle_salary,
     transactions_to_csv,
     unspent_capacity,
+    upcoming_bills,
 )
 
 st.set_page_config(page_title="50/30/20 Budget Tracker", page_icon="💰", layout="wide")
+
+# Full-width widgets for phones. Streamlit is replacing use_container_width with width="stretch";
+# stretch_width_kwargs() picks whichever the installed version supports (and {} if it's the default).
+BTN = stretch_width_kwargs(st.button)
+FORM_BTN = stretch_width_kwargs(st.form_submit_button)
+DL_BTN = stretch_width_kwargs(st.download_button)
+DF = stretch_width_kwargs(st.dataframe)
+EDITOR = stretch_width_kwargs(st.data_editor)
 
 PAGES = ("📊 Dashboard", "🧾 Transactions", "🔁 Recurring Bills", "📈 Analytics", "🏦 Savings", "💳 Debts",
          "🛠️ Developer")
@@ -124,7 +138,7 @@ if active_cycle:
     st.sidebar.markdown(f"**Active cycle**  \n{active_cycle['cycle_name']}  \n"
                         f"{active_cycle['start_date']} → {active_cycle['end_date']}")
 
-if st.sidebar.button("🌱 Seed Sample PHP Data"):
+if st.sidebar.button("🌱 Seed Sample PHP Data", **BTN):
     counts = service.seed_sample_data()
     flash(f"Seeded {counts['transactions']} transactions, {counts['savings_accounts']} savings "
           f"accounts, {counts['debts']} debts and {counts['recurring_templates']} recurring bills. "
@@ -138,7 +152,7 @@ with st.sidebar.expander("⚠️ Danger Zone"):
                "accounts and recurring bills. This cannot be undone.")
     typed = st.text_input(f"Type {WIPE_PHRASE} and press Enter to confirm", key="wipe_confirm_text")
     st.button("🗑️ Wipe All Data (Fresh Slate)", key="wipe_btn", type="primary",
-              disabled=typed.strip() != WIPE_PHRASE, on_click=_wipe_everything)
+              disabled=typed.strip() != WIPE_PHRASE, on_click=_wipe_everything, **BTN)
 
 
 # --------------------------------------------------------------- dashboard
@@ -156,23 +170,23 @@ def _apply_top_up(cycle_id: str) -> None:
 
 
 def render_top_up_form(cycle: dict) -> None:
-    with st.expander("➕ Add 15th/30th Paycheck or Top-Up Salary"):
-        c1, c2 = st.columns(2)
-        amount = c1.number_input("Additional net salary (₱)", min_value=0.0, step=500.0, format="%.2f",
-                                 key="topup_amount")
-        c2.text_input("Note (optional)", placeholder="30th paycheck, bonus...", key="topup_note")
-        if amount > 0:
-            new_net = round(cycle["net_salary"] + amount, 2)
-            caps = calculate_split(new_net)
-            st.caption(f"New net salary {peso(new_net)} → Needs {peso(caps['needs_cap'])} · "
-                       f"Wants {peso(caps['wants_cap'])} · Savings & Debt {peso(caps['savings_debt_cap'])}")
-        st.button("Add to active cycle", type="primary", key="topup_btn",
-                  on_click=_apply_top_up, args=(cycle["id"],))
-        history = cycle.get("top_ups") or []
-        if history:
-            st.markdown("**Top-up history**")
-            st.dataframe(pd.DataFrame(history).reindex(columns=["at", "amount", "note", "net_salary_after"]),
-                         hide_index=True)
+    st.caption("Add a 15th/30th paycheck or any other top-up to this cycle's net salary. The 50/30/20 caps are re-split.")
+    c1, c2 = st.columns(2)
+    amount = c1.number_input("Additional net salary (₱)", min_value=0.0, step=500.0, format="%.2f",
+                             key="topup_amount")
+    c2.text_input("Note (optional)", placeholder="30th paycheck, bonus...", key="topup_note")
+    if amount > 0:
+        new_net = round(cycle["net_salary"] + amount, 2)
+        caps = calculate_split(new_net)
+        st.caption(f"New net salary {peso(new_net)} → Needs {peso(caps['needs_cap'])} · "
+                   f"Wants {peso(caps['wants_cap'])} · Savings & Debt {peso(caps['savings_debt_cap'])}")
+    st.button("Add to active cycle", type="primary", key="topup_btn",
+              on_click=_apply_top_up, args=(cycle["id"],), **BTN)
+    history = cycle.get("top_ups") or []
+    if history:
+        st.markdown("**Top-up history**")
+        st.dataframe(pd.DataFrame(history).reindex(columns=["at", "amount", "note", "net_salary_after"]),
+                     hide_index=True, **DF)
 
 
 def _sync_cycle_end() -> None:
@@ -208,51 +222,105 @@ def render_new_cycle_form(expanded: bool) -> None:
             caps = calculate_split(salary)
             c3.caption(f"Needs {peso(caps['needs_cap'])} · Wants {peso(caps['wants_cap'])} · "
                        f"Savings & Debt {peso(caps['savings_debt_cap'])}")
-        if st.button("Create & activate cycle", type="primary", disabled=invalid):
+        if st.button("Create & activate cycle", type="primary", disabled=invalid, **BTN):
             run_action(lambda: service.create_cycle(name, salary, start, end, st.session_state["new_cycle_freq"]),
                        f"Cycle '{name}' created.")
 
 
 def render_edit_cycle_dates(cycle: dict) -> None:
-    with st.expander("✏️ Edit cycle dates"):
-        c1, c2 = st.columns(2)
-        start = c1.date_input("Cycle start date", value=date.fromisoformat(cycle["start_date"]),
-                              key=f"cycle_edit_start_{cycle['id']}")
-        end = c2.date_input("Cycle end date", value=date.fromisoformat(cycle["end_date"]),
-                            key=f"cycle_edit_end_{cycle['id']}")
-        if end < start:
-            st.error("The end date cannot be before the start date.")
-        st.caption("Transactions belong to the cycle, not its dates, so existing entries are unaffected.")
-        if st.button("Save cycle dates", key=f"cycle_edit_btn_{cycle['id']}", disabled=end < start):
-            run_action(lambda: service.update_cycle_dates(cycle["id"], start, end), "Cycle dates updated.")
+    c1, c2 = st.columns(2)
+    start = c1.date_input("Cycle start date", value=date.fromisoformat(cycle["start_date"]),
+                          key=f"cycle_edit_start_{cycle['id']}")
+    end = c2.date_input("Cycle end date", value=date.fromisoformat(cycle["end_date"]),
+                        key=f"cycle_edit_end_{cycle['id']}")
+    if end < start:
+        st.error("The end date cannot be before the start date.")
+    st.caption("Transactions belong to the cycle, not its dates, so existing entries are unaffected.")
+    if st.button("Save cycle dates", key=f"cycle_edit_btn_{cycle['id']}", disabled=end < start, **BTN):
+        run_action(lambda: service.update_cycle_dates(cycle["id"], start, end), "Cycle dates updated.")
 
 
 def render_sweep(cycle: dict) -> None:
-    with st.expander("🧹 Sweep Unspent to Savings"):
-        info = unspent_capacity(cycle, service.list_transactions(cycle_id=cycle["id"]))
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Unspent Needs", peso(info["needs"]))
-        m2.metric("Unspent Wants", peso(info["wants"]))
-        m3.metric("Sweepable now", peso(info["sweepable"]))
-        if info["already_swept"]:
-            st.caption(f"Already swept this cycle: {peso(info['already_swept'])}.")
-        st.caption("Moves the unspent Needs + Wants budget into ONE Savings transaction. A bucket that is over "
-                   "its cap counts as 0. Sweeps are not counted against the 20% cap. To undo, delete the "
-                   "'Rollover sweep' transaction and the savings balance is reversed.")
-        accounts = service.list_savings_accounts()
-        if not accounts:
-            st.info("Add a savings account on the Savings page first.")
-            return
-        labels = {a["id"]: f"{a['bank_name']} - {a['goal_name'] or 'Savings'} ({peso(a['current_balance'])})"
-                  for a in accounts}
-        target = st.selectbox("Sweep into", list(labels), format_func=labels.get, key="sweep_account")
-        confirmed = True
-        if date.today().isoformat() < cycle["end_date"]:
-            confirmed = st.checkbox(f"This cycle ends {cycle['end_date']}. Sweep anyway.", key="sweep_early")
-        if st.button("🧹 Sweep Unspent to Savings", type="primary", key="sweep_btn",
-                     disabled=info["sweepable"] <= 0 or not confirmed):
-            run_action(lambda: service.sweep_unspent_to_savings(cycle["id"], target),
-                       f"Swept {peso(info['sweepable'])} into savings.")
+    info = unspent_capacity(cycle, service.list_transactions(cycle_id=cycle["id"]))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Unspent Needs", peso(info["needs"]))
+    m2.metric("Unspent Wants", peso(info["wants"]))
+    m3.metric("Sweepable now", peso(info["sweepable"]))
+    if info["already_swept"]:
+        st.caption(f"Already swept this cycle: {peso(info['already_swept'])}.")
+    st.caption("Moves the unspent Needs + Wants budget into ONE Savings transaction. A bucket that is over "
+               "its cap counts as 0. Sweeps are not counted against the 20% cap. To undo, delete the "
+               "'Rollover sweep' transaction and the savings balance is reversed.")
+    accounts = service.list_savings_accounts()
+    if not accounts:
+        st.info("Add a savings account on the Savings page first.")
+        return
+    labels = {a["id"]: f"{a['bank_name']} - {a['goal_name'] or 'Savings'} ({peso(a['current_balance'])})"
+              for a in accounts}
+    target = st.selectbox("Sweep into", list(labels), format_func=labels.get, key="sweep_account")
+    confirmed = True
+    if date.today().isoformat() < cycle["end_date"]:
+        confirmed = st.checkbox(f"This cycle ends {cycle['end_date']}. Sweep anyway.", key="sweep_early")
+    if st.button("🧹 Sweep Unspent to Savings", type="primary", key="sweep_btn",
+                 disabled=info["sweepable"] <= 0 or not confirmed, **BTN):
+        run_action(lambda: service.sweep_unspent_to_savings(cycle["id"], target),
+                   f"Swept {peso(info['sweepable'])} into savings.")
+
+
+QUICK_ADD_PRESETS = ("Commute/Fare", "Lunch", "Coffee", "Groceries", "Mobile load", "Custom")
+
+
+def render_cycle_actions(cycle: dict) -> None:
+    """Top-up, date editing and sweeping tucked into one expander so they stay out of the daily view."""
+    with st.expander("⚙️ Cycle Actions & Settings"):
+        top_up_tab, dates_tab, sweep_tab = st.tabs(["💵 Top-up salary", "📅 Edit dates", "🧹 Sweep unspent"])
+        with top_up_tab:
+            render_top_up_form(cycle)
+        with dates_tab:
+            render_edit_cycle_dates(cycle)
+        with sweep_tab:
+            render_sweep(cycle)
+
+
+def render_upcoming_bills(transactions: list[dict]) -> None:
+    """Warn about recurring bills due within the next week (bills already posted are left out)."""
+    bills = upcoming_bills(service.list_recurring_templates(), transactions=transactions)
+    if not bills:
+        return
+    lines = "\n".join(f"- **{b['name']}** · {peso(b['amount'])} · due {due_label(b['days_until'])} "
+                      f"({date.fromisoformat(b['due_date']):%b %d})" for b in bills)
+    st.warning(f"**🔔 {len(bills)} bill(s) due within {UPCOMING_BILLS_DAYS} days · "
+               f"{peso(sum(b['amount'] for b in bills))}**\n\n{lines}\n\n"
+               "Post them from the **Recurring Bills** page.")
+
+
+def _apply_quick_preset(gen: int) -> None:
+    """Selectbox callback: copy the chosen preset into the Category box (runs before the rerun)."""
+    preset = st.session_state.get(f"qa_preset_{gen}", "Custom")
+    st.session_state[f"qa_category_{gen}"] = "" if preset == "Custom" else preset
+
+
+def render_quick_add(cycle: dict) -> None:
+    gen = st.session_state.setdefault("qa_gen", 0)  # bumped after saving so the form starts fresh
+    with st.container(border=True):
+        st.markdown("**⚡ Quick Add Expense**")
+        bucket = st.radio("Bucket", SPEND_BUCKETS, horizontal=True, key=f"qa_bucket_{gen}")  # Needs is first
+        c1, c2 = st.columns(2)
+        c1.selectbox("Common presets", QUICK_ADD_PRESETS, index=len(QUICK_ADD_PRESETS) - 1,
+                     key=f"qa_preset_{gen}", on_change=_apply_quick_preset, args=(gen,))
+        category = c2.text_input("Category", key=f"qa_category_{gen}", placeholder="e.g. Lunch")
+        amount = c1.number_input("Amount (₱)", min_value=0.0, step=10.0, format="%.2f", key=f"qa_amount_{gen}")
+        channel = c2.selectbox("Paid with", PAYMENT_CHANNELS, key=f"qa_channel_{gen}")
+        notes = st.text_input("Notes (optional)", key=f"qa_notes_{gen}", placeholder="#hashtags work too")
+        if not (cycle["start_date"] <= date.today().isoformat() <= cycle["end_date"]):
+            st.caption("Heads-up: today is outside this cycle's dates.")
+
+        def save() -> None:
+            quick_add_expense(db, cycle["id"], amount, category, bucket, channel, notes)
+            st.session_state["qa_gen"] = gen + 1
+
+        if st.button("➕ Add expense", type="primary", key=f"qa_btn_{gen}", **BTN):
+            run_action(save, f"Logged {peso(amount)} under {bucket}: {category.strip()}.")
 
 
 def page_dashboard() -> None:
@@ -263,8 +331,10 @@ def page_dashboard() -> None:
         render_new_cycle_form(expanded=True)
         return
 
-    summary = service.cycle_summary(cycle)
+    txs = service.list_transactions(cycle_id=cycle["id"])
+    summary = summarize_cycle(cycle, txs)
     st.subheader(f"{cycle['cycle_name']}  ·  {cycle['start_date']} → {cycle['end_date']}")
+    render_upcoming_bills(txs)
     top = st.columns(3)
     top[0].metric("Net salary", peso(cycle["net_salary"]))
     top[1].metric("Allocated so far", peso(summary["total_allocated"]))
@@ -284,17 +354,19 @@ def page_dashboard() -> None:
         st.caption(f"Extra income logged this cycle: {peso(summary['other_income'])}")
     if summary["swept"]:
         st.caption(f"Rolled over to savings: {peso(summary['swept'])} (not counted against the 20% cap).")
-    render_top_up_form(cycle)
-    render_edit_cycle_dates(cycle)
-    render_sweep(cycle)
+
+    render_quick_add(cycle)
 
     st.subheader("Recent transactions")
-    recent = service.list_transactions(cycle_id=cycle["id"])[:8]
-    if recent:
-        st.dataframe(pd.DataFrame(recent)[["date", "bucket", "category", "amount", "payment_channel"]],
-                     hide_index=True)
+    if txs:
+        st.dataframe(pd.DataFrame(txs[:8])[["date", "category", "bucket", "amount"]], hide_index=True,
+                     column_config={"date": "Date", "category": "Category", "bucket": "Bucket",
+                                    "amount": st.column_config.NumberColumn("₱", format="%.2f")}, **DF)
+        st.caption(f"Latest {min(len(txs), 8)} of {len(txs)}. Full history is on the Transactions page.")
     else:
-        st.caption("Nothing logged yet - head to the Transactions page.")
+        st.caption("Nothing logged yet. Use Quick Add above or head to the Transactions page.")
+
+    render_cycle_actions(cycle)
 
     cycles = service.list_cycles()
     if len(cycles) > 1:
@@ -302,7 +374,7 @@ def page_dashboard() -> None:
             options = {c["id"]: f"{c['cycle_name']} ({c['start_date']})" for c in cycles}
             choice = st.selectbox("Cycle", list(options), format_func=options.get,
                                   index=list(options).index(cycle["id"]))
-            if st.button("Make active") and choice != cycle["id"]:
+            if st.button("Make active", **BTN) and choice != cycle["id"]:
                 run_action(lambda: service.activate_cycle(choice), "Cycle switched.")
     render_new_cycle_form(expanded=False)
 
@@ -354,7 +426,7 @@ def render_single_tx_form(cycle: dict, accounts: list[dict], debts: list[dict]) 
             if not labels:
                 st.warning("No active debts. Add one on the Debts page first.")
         notes = st.text_input("Notes (optional)")
-        submitted = st.form_submit_button("Add transaction", type="primary")
+        submitted = st.form_submit_button("Add transaction", type="primary", **FORM_BTN)
     if submitted:
         if not (cycle["start_date"] <= tx_date.isoformat() <= cycle["end_date"]):
             st.warning("That date is outside the active pay cycle, so it is saved but won't appear on the "
@@ -384,7 +456,7 @@ def render_split_form(cycle: dict, accounts: list[dict], debts: list[dict]) -> N
             "Bucket": st.column_config.SelectboxColumn("Bucket", options=list(LOG_BUCKETS), required=True),
             "Amount": st.column_config.NumberColumn("Amount (₱)", min_value=0.0, step=50.0, format="%.2f"),
             "Target": st.column_config.SelectboxColumn("Target (Savings/Debt rows)", options=list(options)),
-        })
+        }, **EDITOR)
     parts = []
     for _, row in edited.iterrows():
         category = str(_cell(row["Category"]) or "").strip()
@@ -410,7 +482,7 @@ def render_split_form(cycle: dict, accounts: list[dict], debts: list[dict]) -> N
         service.log_split_transaction(cycle["id"], tx_date, channel, parts, total_amount=total, notes=notes)
         st.session_state["split_gen"] = gen + 1
 
-    if st.button("Add split transaction", type="primary", key=f"split_btn_{gen}", disabled=not parts):
+    if st.button("Add split transaction", type="primary", key=f"split_btn_{gen}", disabled=not parts, **BTN):
         run_action(save, f"Logged {peso(total)} split across {len(parts)} rows.")
 
 
@@ -425,7 +497,7 @@ def render_import_export(cycle: dict, accounts: list[dict]) -> None:
         slug = re.sub(r"[^A-Za-z0-9]+", "_", cycle["cycle_name"]).strip("_") or "cycle"
         st.download_button("⬇️ Download transactions (CSV)", key="tx_export", mime="text/csv",
                            data=transactions_to_csv(everything, names).encode("utf-8-sig"),
-                           file_name=f"transactions_{slug}.csv", disabled=not everything)
+                           file_name=f"transactions_{slug}.csv", disabled=not everything, **DL_BTN)
         st.divider()
 
         st.markdown("**Import a bank CSV** (needs Date, Amount and Description columns)")
@@ -477,7 +549,7 @@ def render_import_export(cycle: dict, accounts: list[dict]) -> None:
                 "Bucket": st.column_config.SelectboxColumn("Bucket", options=list(LOG_BUCKETS), required=True),
                 "Channel": st.column_config.SelectboxColumn("Channel", options=list(PAYMENT_CHANNELS), required=True),
                 "Target": st.column_config.SelectboxColumn("Target (Savings/Debt)", options=list(options)),
-            })
+            }, **EDITOR)
         rows = []
         for _, r in edited.iterrows():
             if not r["Import"]:
@@ -497,7 +569,7 @@ def render_import_export(cycle: dict, accounts: list[dict]) -> None:
             service.import_transactions(cycle["id"], rows, default_channel)
             st.session_state["imp_gen"] = gen + 1
 
-        if st.button("Import selected rows", type="primary", key=f"imp_btn_{gen}", disabled=not rows):
+        if st.button("Import selected rows", type="primary", key=f"imp_btn_{gen}", disabled=not rows, **BTN):
             run_action(commit, f"Imported {len(rows)} transaction(s) totalling {peso(total)}.")
 
 
@@ -535,13 +607,13 @@ def page_transactions() -> None:
     df = pd.DataFrame(txs)
     df["target"] = df["target_account_id"].map(lambda i: names.get(i, "") if i else "")
     st.dataframe(df[["date", "bucket", "category", "amount", "payment_channel", "target", "notes"]],
-                 hide_index=True)
+                 hide_index=True, **DF)
     st.caption(f"{len(txs)} transaction(s) · total {peso(sum(t['amount'] for t in txs))}")
 
     st.markdown("**Delete a transaction** (savings and debt balances are reversed automatically)")
     labels = {t["id"]: f"{t['date']} · {t['bucket']} · {t['category']} · {peso(t['amount'])}" for t in txs}
     victim = st.selectbox("Transaction", list(labels), format_func=labels.get, label_visibility="collapsed")
-    if st.button("🗑️ Delete selected"):
+    if st.button("🗑️ Delete selected", **BTN):
         run_action(lambda: service.delete_transaction(victim), "Transaction deleted.")
 
 
@@ -598,7 +670,7 @@ def page_recurring() -> None:
         when = "today" if days == 0 else f"in {days} day(s)"
         target = f" · → {names.get(tpl.get('target_account_id'), 'unknown target')}" if tpl.get("target_account_id") else ""
         c1.caption(f"{'🔔 ' if days <= 7 else ''}Due day {tpl['due_day']} · next {due:%b %d} ({when}){target}")
-        if c2.button("🗑️", key=f"rec_del_{tpl['id']}", help="Delete this template"):
+        if c2.button("🗑️", key=f"rec_del_{tpl['id']}", help="Delete this template", **BTN):
             run_action(lambda tid=tpl["id"]: service.delete_recurring_template(tid), f"Deleted {tpl['name']}.")
 
     if templates and cycle is not None:
@@ -608,7 +680,7 @@ def page_recurring() -> None:
             p1.warning("That date is outside the active pay cycle.")
         p2.caption(f"{selected_count} selected · {peso(selected_total)}")
         p2.button("Post Selected Bills to Active Cycle", type="primary",
-                  on_click=_post_selected_bills, args=(cycle["id"],))
+                  on_click=_post_selected_bills, args=(cycle["id"],), **BTN)
         st.caption("Each bill is logged like a manual transaction, so savings and debt balances update too. "
                    "Posting the same bill twice logs it twice.")
 
@@ -632,7 +704,7 @@ def page_recurring() -> None:
             target = c2.selectbox("Pay toward", list(labels), format_func=labels.get) if labels else None
             if not labels:
                 st.warning("No active debts. Add one on the Debts page first.")
-        submitted = st.form_submit_button("Add recurring bill", type="primary")
+        submitted = st.form_submit_button("Add recurring bill", type="primary", **FORM_BTN)
     if submitted:
         run_action(lambda: service.create_recurring_template(name, amount, category, bucket, channel,
                                                              due_day, target),
@@ -713,7 +785,7 @@ def page_analytics() -> None:
     if totals:
         st.subheader("Spend by hashtag")
         st.dataframe(pd.DataFrame([{"Hashtag": f"#{r['tag']}", "Transactions": r["count"], "Total": r["amount"]}
-                                   for r in totals]), hide_index=True)
+                                   for r in totals]), hide_index=True, **DF)
         st.caption("A transaction with several hashtags counts toward each. Income and sweeps are excluded.")
 
 
@@ -748,7 +820,7 @@ def page_savings() -> None:
                          "Monthly net": round(ap["monthly_net"], 2), "Annual net": round(ap["annual_net"], 2),
                          "Annual gross": round(ap["annual_gross"], 2)})
         st.markdown("**Projected interest by account**")
-        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, **DF)
     else:
         st.info("No savings accounts yet - add one below.")
     st.caption("Log a transaction in the **Savings** bucket to deposit into an account automatically.")
@@ -760,7 +832,7 @@ def page_savings() -> None:
         goal = c2.text_input("Goal name", placeholder="Go Save, Travel fund...")
         balance = c1.number_input("Starting balance (₱)", min_value=0.0, step=100.0, format="%.2f")
         rate = c2.number_input("Interest rate (% p.a.)", min_value=0.0, max_value=100.0, step=0.25, format="%.2f")
-        if st.form_submit_button("Add account", type="primary"):
+        if st.form_submit_button("Add account", type="primary", **FORM_BTN):
             run_action(lambda: service.add_savings_account(bank, goal, balance, rate),
                        f"Added {bank}.")
 
@@ -795,7 +867,7 @@ def page_debts() -> None:
         remaining = d2.number_input("Remaining balance (₱)", min_value=0.0, step=500.0, format="%.2f",
                                     help="Leave at 0 only if already paid; must not exceed the total.")
         minimum = d1.number_input("Minimum payment (₱)", min_value=0.0, step=100.0, format="%.2f")
-        if st.form_submit_button("Add debt", type="primary"):
+        if st.form_submit_button("Add debt", type="primary", **FORM_BTN):
             run_action(lambda: service.add_debt(name, total, minimum, due, remaining_balance=remaining),
                        f"Added {name}.")
 
@@ -809,7 +881,7 @@ def page_developer() -> None:
     with log_tab:
         c1, c2 = st.columns([3, 1])
         limit = c1.slider("Entries to show", 5, 100, 25)
-        if c2.button("Clear log"):
+        if c2.button("Clear log", **BTN):
             QUERY_LOG.clear()
             st.rerun()
         entries = QUERY_LOG.recent(limit)
@@ -824,7 +896,7 @@ def page_developer() -> None:
                     st.json(entry["payload"], expanded=False)
 
     with docs_tab:
-        st.button("🔄 Refresh")
+        st.button("🔄 Refresh", **BTN)
         snapshot = db.snapshot()
         for name in ALL_COLLECTIONS:
             docs = snapshot.get(name, [])
