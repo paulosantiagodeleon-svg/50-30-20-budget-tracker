@@ -47,6 +47,14 @@ from src.services import (
 
 st.set_page_config(page_title="50/30/20 Budget Tracker", page_icon="💰", layout="wide")
 
+import os
+import json
+
+# Securely generate the Firebase key file in the cloud using Streamlit Secrets
+if not os.path.exists("serviceAccountKey.json") and "firebase" in st.secrets:
+    with open("serviceAccountKey.json", "w") as f:
+        json.dump(dict(st.secrets["firebase"]), f)
+
 # Full-width widgets for phones. Streamlit is replacing use_container_width with width="stretch";
 # stretch_width_kwargs() picks whichever the installed version supports (and {} if it's the default).
 BTN = stretch_width_kwargs(st.button)
