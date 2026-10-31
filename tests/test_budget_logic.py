@@ -61,6 +61,19 @@ from src.services import (  # v1.2.1 additions
     stretch_width_kwargs,
     upcoming_bills,
 )
+from src.services import (  # v1.2.2 additions
+    account_references,
+    cycle_base_salary,
+    delete_cycle,
+    delete_debt,
+    delete_savings_account,
+    edit_cycle,
+    edit_debt,
+    edit_recurring_template,
+    edit_savings_account,
+    edit_transaction,
+    split_group_id,
+)
 
 
 def make_service(tmp: str):
@@ -1313,4 +1326,591 @@ def test_stretch_width_kwargs_picks_the_api_the_installed_streamlit_supports():
 def test_ui_state_prefixes_cover_the_quick_add_widgets():
     state = {"qa_gen": 1, "qa_category_0": "Lunch", "qa_preset_0": "Lunch", "keep_me": 1}
     assert sorted(clear_ui_state(state)) == ["qa_category_0", "qa_gen", "qa_preset_0"]
+    assert state == {"keep_me": 1}
+
+
+# =====================================================================  v1.2.2
+def _batches(db):
+    return [e for e in db.logger.recent() if e["operation"].startswith("BATCH")]
+
+
+def _writes(db):
+    return [e for e in db.logger.recent() if e["operation"].startswith(("WRITE", "BATCH"))]
+
+
+def _balance(db, account_id):
+    return db.get(SAVINGS_ACCOUNTS, account_id)["current_balance"]
+
+
+def _remaining(db, debt_id):
+    return db.get(DEBTS, debt_id)["remaining_balance"]
+
+
+# ----------------------------------------------------------------- helpers
+def test_split_group_id_recognises_split_fragments_only():
+    assert split_group_id("Mall #errands | split ab12cd34 1/2") == "ab12cd34"
+    assert split_group_id("split ab12cd34 2/2") == "ab12cd34"
+    for text in ("split plan #x", "splitting 1/2", "split ab12cd3 1/2", "split AB12CD34 1/2", "",
+                 None, "xsplit ab12cd34 1/2", "split ab12cd34 1/2 extra"):
+        assert split_group_id(text) is None, text
+    with tempfile.TemporaryDirectory() as tmp:
+        service, _ = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        result = service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", [
+            {"category": "A", "bucket": "Needs", "amount": 10}, {"category": "B", "bucket": "Wants", "amount": 5}],
+            notes="shared #note")
+        assert {split_group_id(t["notes"]) for t in result["transactions"]} == {result["split_id"]}
+
+
+def test_cycle_base_salary_excludes_top_ups():
+    assert cycle_base_salary({"net_salary": 30000}) == 30000
+    assert cycle_base_salary({"net_salary": 35000, "top_ups": [{"amount": 5000}]}) == 30000
+    assert cycle_base_salary({"net_salary": 38000.5, "top_ups": [{"amount": 5000}, {"amount": 2500.5}]}) == 30500
+
+
+# ------------------------------------------------- edit_transaction: plain fields
+def test_edit_transaction_changes_plain_fields_and_keeps_identity():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 400, "Fare", "Needs", "Cash", notes="old")
+        updated = edit_transaction(db, tx["id"], new_date=date(2026, 10, 3), new_amount=450.5, new_category="Grab",
+                                   new_bucket="Wants", new_channel="Maya", new_notes="evening #ride")
+        assert (updated["id"], updated["created_at"], updated["cycle_id"]) == (tx["id"], tx["created_at"], cycle["id"])
+        assert (updated["date"], updated["amount"], updated["category"], updated["bucket"],
+                updated["payment_channel"], updated["notes"]) == ("2026-10-03", 450.5, "Grab", "Wants", "Maya", "evening #ride")
+        assert db.get(TRANSACTIONS, tx["id"]) == updated and len(db.query(TRANSACTIONS)) == 1
+        summary = service.cycle_summary(db.get("income_cycles", cycle["id"]))
+        assert summary["spent"]["Needs"] == 0 and summary["spent"]["Wants"] == 450.5
+        assert collect_tags(service.list_transactions(cycle["id"])) == {"ride": 1}
+        assert service.edit_transaction(tx["id"], "2026-10-04", 10)["amount"] == 10  # positional order: date, amount
+
+
+def test_edit_transaction_without_changes_writes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 400, "Fare", "Needs", "Cash", notes="n")
+        db.logger.clear()
+        assert edit_transaction(db, tx["id"]) == tx
+        assert edit_transaction(db, tx["id"], new_amount=400, new_category="Fare", new_notes="n") == tx
+        assert _writes(db) == []
+
+
+# ------------------------------------- edit_transaction: atomic balance recalculation
+def test_edit_savings_amount_applies_the_delta_in_one_atomic_batch():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash",
+                                     target_account_id=account["id"])
+        assert _balance(db, account["id"]) == 1500
+        db.logger.clear()
+        edit_transaction(db, tx["id"], new_amount=800)
+        assert _balance(db, account["id"]) == 1800 and db.get(TRANSACTIONS, tx["id"])["amount"] == 800
+        batches = _batches(db)
+        assert len(batches) == 1 and batches[0]["result_count"] == 2  # the transaction + the balance, together
+        assert [e for e in _writes(db) if not e["operation"].startswith("BATCH")] == []
+        summary = service.cycle_summary(db.get("income_cycles", cycle["id"]))
+        assert summary["lines"]["Savings & Debt"]["spent"] == 800
+        edit_transaction(db, tx["id"], new_amount=100)
+        assert _balance(db, account["id"]) == 1100
+
+
+def test_edit_savings_target_moves_the_money_between_accounts():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        other = service.add_savings_account("MariBank", "Travel", 2000)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash",
+                                     target_account_id=account["id"])
+        db.logger.clear()
+        edit_transaction(db, tx["id"], new_amount=700, new_target_account_id=other["id"])
+        assert _balance(db, account["id"]) == 1000 and _balance(db, other["id"]) == 2700
+        assert db.get(TRANSACTIONS, tx["id"])["target_account_id"] == other["id"]
+        assert len(_batches(db)) == 1 and _batches(db)[0]["result_count"] == 3
+
+
+def test_edit_bucket_changes_reverse_and_apply_balances():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        save = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash",
+                                       target_account_id=account["id"])
+        edit_transaction(db, save["id"], new_bucket="Wants")  # Savings -> Wants: deposit reversed, target dropped
+        assert _balance(db, account["id"]) == 1000 and db.get(TRANSACTIONS, save["id"])["target_account_id"] is None
+        edit_transaction(db, save["id"], new_bucket="Savings", new_target_account_id=account["id"])  # and back
+        assert _balance(db, account["id"]) == 1500
+        pay = service.add_transaction(cycle["id"], "2026-10-02", 2000, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        edit_transaction(db, pay["id"], new_bucket="Savings", new_target_account_id=account["id"])  # Debt -> Savings
+        assert _remaining(db, debt["id"]) == 8000 and _balance(db, account["id"]) == 3500
+        edit_transaction(db, pay["id"], new_bucket="Debt", new_target_account_id=debt["id"])  # Savings -> Debt
+        assert _remaining(db, debt["id"]) == 6000 and _balance(db, account["id"]) == 1500
+
+
+def test_edit_needs_a_target_when_the_bucket_becomes_savings_or_debt():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 300, "Lunch", "Wants", "Cash")
+        before = db.get(TRANSACTIONS, tx["id"])
+        for kwargs in ({"new_bucket": "Savings"}, {"new_bucket": "Debt"},
+                       {"new_bucket": "Savings", "new_target_account_id": debt["id"]},      # a debt is not an account
+                       {"new_bucket": "Debt", "new_target_account_id": account["id"]},
+                       {"new_bucket": "Savings", "new_target_account_id": "ghost"}):
+            with pytest.raises(ValidationError):
+                edit_transaction(db, tx["id"], **kwargs)
+        assert db.get(TRANSACTIONS, tx["id"]) == before
+        assert _balance(db, account["id"]) == 1000 and _remaining(db, debt["id"]) == 8000
+        edit_transaction(db, tx["id"], new_bucket="Savings", new_target_account_id=account["id"])
+        assert _balance(db, account["id"]) == 1300
+
+
+def test_edit_debt_payment_updates_remaining_and_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, debt = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-03", 2000, "Card", "Debt", "GoTyme", target_account_id=debt["id"])
+        assert _remaining(db, debt["id"]) == 6000
+        edit_transaction(db, tx["id"], new_amount=500)
+        assert _remaining(db, debt["id"]) == 7500 and db.get(DEBTS, debt["id"])["status"] == "active"
+        edit_transaction(db, tx["id"], new_amount=8000)
+        assert _remaining(db, debt["id"]) == 0 and db.get(DEBTS, debt["id"])["status"] == "paid"
+        edit_transaction(db, tx["id"], new_amount=100)
+        assert _remaining(db, debt["id"]) == 7900 and db.get(DEBTS, debt["id"])["status"] == "active"
+
+
+def test_edit_debt_overpayment_is_rejected_without_any_change():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, debt = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-03", 2000, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        before = db.get(TRANSACTIONS, tx["id"])
+        db.logger.clear()
+        with pytest.raises(ValidationError) as err:
+            edit_transaction(db, tx["id"], new_amount=8001)
+        assert "exceeds" in str(err.value) and "8,000.00" in str(err.value)  # the old 2,000 counts as available
+        assert db.get(TRANSACTIONS, tx["id"]) == before and _remaining(db, debt["id"]) == 6000
+        assert _writes(db) == []
+        edit_transaction(db, tx["id"], new_amount=8000)  # exactly the available amount is fine
+        assert _remaining(db, debt["id"]) == 0
+
+
+def test_edit_cannot_push_a_balance_below_zero_or_a_debt_above_its_total():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        save = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash", target_account_id=account["id"])
+        edit_savings_account(db, account["id"], new_balance=100)  # a manual correction after the deposit
+        for kwargs in ({"new_amount": 50}, {"new_bucket": "Wants"}):  # both would reverse more than is there
+            with pytest.raises(ValidationError) as err:
+                edit_transaction(db, save["id"], **kwargs)
+            assert "below zero" in str(err.value)
+        assert db.get(TRANSACTIONS, save["id"])["amount"] == 500 and _balance(db, account["id"]) == 100
+        edit_transaction(db, save["id"], new_amount=600)  # a bigger deposit is a +100 delta: fine
+        assert _balance(db, account["id"]) == 200
+        pay = service.add_transaction(cycle["id"], "2026-10-02", 2000, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        edit_debt(db, debt["id"], new_total_amount=6500, new_remaining_balance=6000)  # total lowered afterwards
+        with pytest.raises(ValidationError) as err:
+            edit_transaction(db, pay["id"], new_bucket="Wants")  # would put the debt at 8,000 > 6,500
+        assert "above its total" in str(err.value) and _remaining(db, debt["id"]) == 6000
+
+
+def test_edit_tolerates_a_target_that_was_deleted():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, debt = setup_world(service)
+        other = service.add_savings_account("MariBank", "Travel", 2000)
+        save = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash", target_account_id=account["id"])
+        pay = service.add_transaction(cycle["id"], "2026-10-02", 700, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        delete_savings_account(db, account["id"])
+        delete_debt(db, debt["id"])
+        # fields that don't change a balance can still be edited
+        assert edit_transaction(db, save["id"], new_category="Renamed", new_notes="kept")["category"] == "Renamed"
+        assert edit_transaction(db, pay["id"], new_notes="also fine")["notes"] == "also fine"
+        for amount in (600,):  # but a new amount can't be applied to an account that is gone
+            with pytest.raises(ValidationError) as err:
+                edit_transaction(db, save["id"], new_amount=amount)
+            assert "no longer exists" in str(err.value)
+        edit_transaction(db, save["id"], new_target_account_id=other["id"])  # re-pointing works; nothing to reverse
+        assert _balance(db, other["id"]) == 2500
+        service.delete_transaction(pay["id"])  # deleting one that points at a deleted debt works too
+        assert db.get(TRANSACTIONS, pay["id"]) is None
+
+
+def test_edit_refuses_sweeps_and_split_fragments():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        service.add_transaction(cycle["id"], "2026-10-02", 400, "Fare", "Needs", "Cash")
+        sweep = sweep_unspent_to_savings(db, cycle["id"], account["id"], today=date(2026, 10, 31))["transaction"]
+        split = service.log_split_transaction(cycle["id"], "2026-10-05", "Cash", [
+            {"category": "A", "bucket": "Needs", "amount": 10}, {"category": "B", "bucket": "Wants", "amount": 5}])
+        snapshot = db.snapshot()
+        with pytest.raises(ValidationError) as err:
+            edit_transaction(db, sweep["id"], new_notes="x")
+        assert "Rollover sweep" in str(err.value) and "Delete" in str(err.value)
+        for part in split["transactions"]:
+            with pytest.raises(ValidationError) as err:
+                edit_transaction(db, part["id"], new_amount=999)
+            assert "split" in str(err.value) and "log it again" in str(err.value)
+        assert db.snapshot() == snapshot
+        service.delete_transaction(split["transactions"][0]["id"])  # delete is still allowed
+        service.delete_transaction(sweep["id"])
+        assert _balance(db, account["id"]) == 1000
+
+
+def test_edit_cannot_turn_a_transaction_into_a_sweep():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        save = service.add_transaction(cycle["id"], "2026-10-02", 100, "Save", "Savings", "Cash", target_account_id=account["id"])
+        wants = service.add_transaction(cycle["id"], "2026-10-02", 100, "Fun", "Wants", "Cash")
+        with pytest.raises(ValidationError):
+            edit_transaction(db, save["id"], new_category="rollover SWEEP")
+        with pytest.raises(ValidationError):
+            edit_transaction(db, wants["id"], new_bucket="Savings", new_target_account_id=account["id"],
+                             new_category="Rollover sweep")
+        assert db.get(TRANSACTIONS, wants["id"])["bucket"] == "Wants" and _balance(db, account["id"]) == 1100
+
+
+def test_edit_transaction_validation_leaves_everything_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, _ = setup_world(service)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 400, "Fare", "Needs", "Cash")
+        snapshot = db.snapshot()
+        for kwargs in ({"new_amount": 0}, {"new_amount": -1}, {"new_amount": "abc"}, {"new_category": "  "},
+                       {"new_bucket": "Nope"}, {"new_date": "not-a-date"}, {"new_channel": " "}):
+            with pytest.raises(ValidationError):
+                edit_transaction(db, tx["id"], **kwargs)
+        with pytest.raises(ValidationError):
+            edit_transaction(db, "no-such-id", new_amount=5)
+        assert db.snapshot() == snapshot
+
+
+# ------------------------------------------------------ savings accounts
+def test_edit_savings_account_updates_only_what_is_given():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, account, _ = setup_world(service)
+        updated = edit_savings_account(db, account["id"], new_bank_name=" MariBank ", new_balance=2500.5)
+        assert (updated["bank_name"], updated["goal_name"], updated["current_balance"]) == ("MariBank", "Go Save", 2500.5)
+        edit_savings_account(db, account["id"], new_goal_name="", new_interest_rate=3.5)  # "" clears the goal
+        stored = db.get(SAVINGS_ACCOUNTS, account["id"])
+        assert (stored["bank_name"], stored["goal_name"], stored["interest_rate"], stored["current_balance"]) == (
+            "MariBank", "", 3.5, 2500.5)
+        db.logger.clear()
+        assert service.edit_savings_account(account["id"], "MariBank", "", 2500.5, 3.5) == stored  # no change
+        assert _writes(db) == []
+
+
+def test_edit_savings_account_rejects_bad_values_and_unknown_ids():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, account, _ = setup_world(service)
+        before = db.get(SAVINGS_ACCOUNTS, account["id"])
+        for kwargs in ({"new_bank_name": "  "}, {"new_balance": -1}, {"new_balance": "abc"},
+                       {"new_interest_rate": 101}, {"new_interest_rate": -1}):
+            with pytest.raises(ValidationError):
+                edit_savings_account(db, account["id"], **kwargs)
+        with pytest.raises(ValidationError):
+            edit_savings_account(db, "no-such-account", new_balance=5)
+        assert db.get(SAVINGS_ACCOUNTS, account["id"]) == before
+
+
+def test_delete_savings_account_keeps_history_and_reports_references():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        other = service.add_savings_account("MariBank", "Travel", 2000)
+        tx = service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash", target_account_id=account["id"])
+        service.create_recurring_template("Auto-Save", 1000, "Auto", "Savings", "GoTyme", 30, target_account_id=account["id"])
+        assert account_references(db, account["id"]) == {"transactions": 1, "recurring_templates": 1}
+        assert account_references(db, "nobody") == {"transactions": 0, "recurring_templates": 0}
+        assert delete_savings_account(db, account["id"]) == {"transactions": 1, "recurring_templates": 1}
+        assert [a["id"] for a in service.list_savings_accounts()] == [other["id"]]
+        assert db.get(TRANSACTIONS, tx["id"])["target_account_id"] == account["id"]  # history is kept
+        service.delete_transaction(tx["id"])  # and can still be deleted
+        assert _balance(db, other["id"]) == 2000
+        for again in (account["id"], "no-such-account"):
+            with pytest.raises(ValidationError):
+                delete_savings_account(db, again)
+        result = service.post_recurring_templates(cycle["id"], [t["id"] for t in service.list_recurring_templates()], "2026-10-15")
+        assert result["posted"] == [] and "no longer exists" in result["failed"][0]["error"]  # reported, not raised
+
+
+# ------------------------------------------------------------------ debts
+def test_edit_debt_updates_fields_and_status():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, _, debt = setup_world(service)
+        updated = edit_debt(db, debt["id"], new_name=" Card ", new_total_amount=12000, new_minimum_payment=750,
+                            new_due_date=date(2026, 11, 5))
+        assert (updated["name"], updated["total_amount"], updated["remaining_balance"], updated["minimum_payment"],
+                updated["due_date"]) == ("Card", 12000, 8000, 750, "2026-11-05")
+        assert edit_debt(db, debt["id"], new_remaining_balance=0)["status"] == "paid"
+        assert service.edit_debt(debt["id"], new_remaining_balance=3000, new_due_date="2026-12-01")["status"] == "active"
+        db.logger.clear()
+        assert edit_debt(db, debt["id"], new_name="Card") == db.get(DEBTS, debt["id"])
+        assert _writes(db) == []
+
+
+def test_edit_debt_rejects_bad_values_and_unknown_ids():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, _, debt = setup_world(service)
+        before = db.get(DEBTS, debt["id"])
+        for kwargs in ({"new_name": ""}, {"new_total_amount": 0}, {"new_total_amount": 5000},  # below the 8,000 remaining
+                       {"new_remaining_balance": 10001}, {"new_remaining_balance": -1}, {"new_minimum_payment": -5},
+                       {"new_due_date": "soon"}, {"new_total_amount": "abc"}):
+            with pytest.raises(ValidationError):
+                edit_debt(db, debt["id"], **kwargs)
+        with pytest.raises(ValidationError):
+            edit_debt(db, "no-such-debt", new_name="x")
+        assert db.get(DEBTS, debt["id"]) == before
+
+
+def test_delete_debt_keeps_history_and_reports_references():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, _, debt = setup_world(service)
+        pay = service.add_transaction(cycle["id"], "2026-10-02", 700, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        service.create_recurring_template("Card payment", 500, "Card", "Debt", "Cash", 20, target_account_id=debt["id"])
+        assert delete_debt(db, debt["id"]) == {"transactions": 1, "recurring_templates": 1}
+        assert service.list_debts() == [] and db.get(TRANSACTIONS, pay["id"]) is not None
+        service.delete_transaction(pay["id"])
+        with pytest.raises(ValidationError):
+            delete_debt(db, debt["id"])
+        result = service.post_recurring_templates(cycle["id"], [t["id"] for t in service.list_recurring_templates()], "2026-10-15")
+        assert result["posted"] == [] and len(result["failed"]) == 1
+
+
+# ------------------------------------------------------- recurring templates
+def test_edit_recurring_template_changes_properties():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, account, _ = setup_world(service)
+        other = service.add_savings_account("MariBank", "Travel", 0)
+        bill = create_recurring_template(db, "Meralco", 3200, "Electricity", "Needs", "Maya", 15)
+        updated = edit_recurring_template(db, bill["id"], new_name=" Meralco Power ", new_amount=3500.5,
+                                          new_category="Utilities", new_channel="GoTyme", new_due_day=20)
+        assert (updated["name"], updated["amount"], updated["category"], updated["payment_channel"], updated["due_day"]) == (
+            "Meralco Power", 3500.5, "Utilities", "GoTyme", 20)
+        assert db.get(RECURRING_TEMPLATES, bill["id"]) == updated
+        save = create_recurring_template(db, "Auto-Save", 1000, "Auto", "Savings", "GoTyme", 30, target_account_id=account["id"])
+        assert edit_recurring_template(db, save["id"], new_target_account_id=other["id"])["target_account_id"] == other["id"]
+        assert service.edit_recurring_template(save["id"], new_due_day=28)["target_account_id"] == other["id"]  # target kept
+        db.logger.clear()
+        assert edit_recurring_template(db, save["id"], new_due_day=28) == db.get(RECURRING_TEMPLATES, save["id"])
+        assert _writes(db) == []
+
+
+def test_edit_recurring_template_bucket_changes_and_validation():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, account, debt = setup_world(service)
+        bill = create_recurring_template(db, "Meralco", 3200, "Electricity", "Needs", "Maya", 15)
+        for kwargs in ({"new_bucket": "Savings"}, {"new_bucket": "Debt"}, {"new_bucket": "Savings", "new_target_account_id": "ghost"},
+                       {"new_bucket": "Debt", "new_target_account_id": account["id"]}, {"new_bucket": "Nope"},
+                       {"new_amount": 0}, {"new_amount": "abc"}, {"new_name": " "}, {"new_category": ""},
+                       {"new_due_day": 0}, {"new_due_day": 32}, {"new_due_day": 1.5}, {"new_due_day": "x"}):
+            with pytest.raises(ValidationError):
+                edit_recurring_template(db, bill["id"], **kwargs)
+        with pytest.raises(ValidationError):
+            edit_recurring_template(db, "no-such-template", new_amount=5)
+        assert db.get(RECURRING_TEMPLATES, bill["id"])["bucket"] == "Needs"
+        saving = edit_recurring_template(db, bill["id"], new_bucket="Savings", new_target_account_id=account["id"])
+        assert (saving["bucket"], saving["target_account_id"]) == ("Savings", account["id"])
+        back = edit_recurring_template(db, bill["id"], new_bucket="Needs")  # an unlinked bucket drops the target
+        assert back["target_account_id"] is None
+
+
+def test_editing_a_template_whose_target_was_deleted_still_works_for_other_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        _, account, _ = setup_world(service)
+        save = create_recurring_template(db, "Auto-Save", 1000, "Auto", "Savings", "GoTyme", 30, target_account_id=account["id"])
+        delete_savings_account(db, account["id"])
+        assert edit_recurring_template(db, save["id"], new_amount=1500)["amount"] == 1500  # not blocked
+        other = service.add_savings_account("MariBank", "Travel", 0)
+        assert edit_recurring_template(db, save["id"], new_target_account_id=other["id"])["target_account_id"] == other["id"]
+
+
+def test_edited_due_day_moves_the_upcoming_bills_alert():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        bill = create_recurring_template(db, "Meralco", 3200, "Electricity", "Needs", "Maya", 25)
+        today = date(2026, 10, 21)
+        assert [b["name"] for b in upcoming_bills(list_recurring_templates(db), today)] == ["Meralco"]
+        edit_recurring_template(db, bill["id"], new_due_day=5)  # now due in 15 days
+        assert upcoming_bills(list_recurring_templates(db), today) == []
+
+
+# ------------------------------------------------------------ income cycles
+def test_edit_cycle_rename_keeps_the_caps():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle = service.create_cycle("Oct 2026", 30000, "2026-10-01")
+        updated = edit_cycle(db, cycle["id"], new_name="  October payroll ")
+        assert updated["cycle_name"] == "October payroll" and updated["net_salary"] == 30000
+        stored = db.get("income_cycles", cycle["id"])
+        assert (stored["needs_cap"], stored["wants_cap"], stored["savings_debt_cap"]) == (15000, 9000, 6000)
+        db.logger.clear()
+        assert service.edit_cycle(cycle["id"], new_name="October payroll") == stored
+        assert _writes(db) == []
+
+
+def test_edit_cycle_base_salary_resplits_caps_and_rebuilds_top_up_history():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle = service.create_cycle("Oct 2026", 30000, "2026-10-01")
+        service.top_up_cycle_salary(cycle["id"], 5000, "bonus")
+        assert cycle_base_salary(db.get("income_cycles", cycle["id"])) == 30000
+        updated = edit_cycle(db, cycle["id"], new_base_net_salary=36000)
+        assert updated["net_salary"] == 41000
+        caps = calculate_split(41000)
+        assert (updated["needs_cap"], updated["wants_cap"], updated["savings_debt_cap"]) == (
+            caps["needs_cap"], caps["wants_cap"], caps["savings_debt_cap"])
+        entry = db.get("income_cycles", cycle["id"])["top_ups"][0]
+        assert (entry["amount"], entry["note"], entry["net_salary_after"]) == (5000, "bonus", 41000)
+        assert cycle_base_salary(db.get("income_cycles", cycle["id"])) == 36000
+
+
+def test_edit_cycle_with_several_top_ups_and_awkward_amounts():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle = service.create_cycle("Oct", 20000, "2026-10-01")
+        service.top_up_cycle_salary(cycle["id"], 5000)
+        service.top_up_cycle_salary(cycle["id"], 2500)
+        updated = edit_cycle(db, cycle["id"], new_base_net_salary=22000)
+        assert updated["net_salary"] == 29500
+        assert [t["net_salary_after"] for t in db.get("income_cycles", cycle["id"])["top_ups"]] == [27000, 29500]
+        odd = edit_cycle(db, cycle["id"], new_base_net_salary=12345.67)
+        assert round(odd["needs_cap"] + odd["wants_cap"] + odd["savings_debt_cap"], 2) == odd["net_salary"] == 19845.67
+        # the dashboard numbers follow the edit
+        service.add_transaction(cycle["id"], "2026-10-02", 9000, "Rent", "Needs", "Cash")
+        assert service.cycle_summary(db.get("income_cycles", cycle["id"]))["lines"]["Needs"]["cap"] == odd["needs_cap"]
+
+
+def test_edit_cycle_handles_a_cycle_saved_before_top_ups_existed():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle = service.create_cycle("Old", 30000, "2026-10-01")
+        legacy = db.get("income_cycles", cycle["id"]); legacy.pop("top_ups")
+        db.set("income_cycles", cycle["id"], legacy)
+        assert edit_cycle(db, cycle["id"], new_base_net_salary=40000)["net_salary"] == 40000
+        assert db.get("income_cycles", cycle["id"])["top_ups"] == []
+
+
+def test_edit_cycle_validation_leaves_the_cycle_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle = service.create_cycle("Oct", 30000, "2026-10-01")
+        before = db.get("income_cycles", cycle["id"])
+        for kwargs in ({"new_base_net_salary": 0}, {"new_base_net_salary": -5}, {"new_base_net_salary": "abc"},
+                       {"new_base_net_salary": float("nan")}, {"new_base_net_salary": float("inf")},
+                       {"new_name": ""}, {"new_name": "   "}):
+            with pytest.raises(ValidationError):
+                edit_cycle(db, cycle["id"], **kwargs)
+        with pytest.raises(ValidationError):
+            edit_cycle(db, "no-such-cycle", new_name="x")
+        assert db.get("income_cycles", cycle["id"]) == before
+
+
+def test_delete_cycle_without_transactions_and_active_cycle_handover():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        sep = service.create_cycle("Sep", 30000, "2026-09-01")
+        octo = service.create_cycle("Oct", 30000, "2026-10-01")
+        nov = service.create_cycle("Nov", 30000, "2026-11-01")  # the active one
+        assert delete_cycle(db, sep["id"]) == {"deleted_transactions": 0, "activated_cycle_id": None, "batches": 1}
+        assert service.get_active_cycle()["id"] == nov["id"]  # deleting an inactive cycle changes nothing else
+        result = service.delete_cycle(nov["id"])
+        assert result["activated_cycle_id"] == octo["id"] and service.get_active_cycle()["id"] == octo["id"]
+        assert delete_cycle(db, octo["id"])["activated_cycle_id"] is None and service.get_active_cycle() is None
+        with pytest.raises(ValidationError):
+            delete_cycle(db, octo["id"])
+
+
+def test_delete_cycle_refuses_when_it_has_transactions_unless_confirmed():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        service.add_transaction(cycle["id"], "2026-10-02", 500, "Save", "Savings", "Cash", target_account_id=account["id"])
+        snapshot = db.snapshot()
+        with pytest.raises(ValidationError) as err:
+            delete_cycle(db, cycle["id"])
+        assert "1 transaction" in str(err.value) and db.snapshot() == snapshot
+
+
+def test_delete_cycle_with_transactions_reverses_every_balance_effect():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        first, account, debt = setup_world(service)
+        second = service.create_cycle("Nov", 30000, "2026-11-01")  # active; first stays inactive
+        service.add_transaction(first["id"], "2026-10-02", 500, "Save", "Savings", "Cash", target_account_id=account["id"])
+        service.add_transaction(first["id"], "2026-10-03", 300, "Save", "Savings", "Cash", target_account_id=account["id"])
+        service.add_transaction(first["id"], "2026-10-04", 700, "Card", "Debt", "Cash", target_account_id=debt["id"])
+        service.add_transaction(first["id"], "2026-10-05", 100, "Fare", "Needs", "Cash")
+        keep = service.add_transaction(second["id"], "2026-11-02", 250, "Save", "Savings", "Cash", target_account_id=account["id"])
+        assert _balance(db, account["id"]) == 2050 and _remaining(db, debt["id"]) == 7300
+        result = delete_cycle(db, first["id"], delete_transactions=True)
+        assert result["deleted_transactions"] == 4 and result["activated_cycle_id"] is None
+        assert db.get("income_cycles", first["id"]) is None and service.list_transactions(first["id"]) == []
+        assert _balance(db, account["id"]) == 1250 and _remaining(db, debt["id"]) == 8000  # only 250 from the other cycle remains
+        assert [t["id"] for t in service.list_transactions(second["id"])] == [keep["id"]]
+        assert service.get_active_cycle()["id"] == second["id"]
+
+
+def test_delete_cycle_tolerates_deleted_accounts_and_batches_in_chunks():
+    with tempfile.TemporaryDirectory() as tmp:
+        service, db = make_service(tmp)
+        cycle, account, _ = setup_world(service)
+        gone = service.add_savings_account("Gone", "x", 10)
+        service.add_transaction(cycle["id"], "2026-10-02", 5, "Orphan", "Savings", "Cash", target_account_id=gone["id"])
+        delete_savings_account(db, gone["id"])
+        for day in range(12):
+            service.add_transaction(cycle["id"], f"2026-10-{day + 1:02d}", 100, "Save", "Savings", "Cash", target_account_id=account["id"])
+        assert _balance(db, account["id"]) == 2200
+        db.logger.clear()
+        result = delete_cycle(db, cycle["id"], delete_transactions=True, chunk_ops=5)
+        assert result["deleted_transactions"] == 13 and result["batches"] == len(_batches(db)) > 1
+        assert _balance(db, account["id"]) == 1000 and db.query(TRANSACTIONS) == []
+        assert db.get("income_cycles", cycle["id"]) is None
+
+
+class _FlakyMock(LocalMockFirestore):
+    """Fails one chosen batch to prove an interrupted cycle deletion leaves a consistent database."""
+    calls = 0
+    fail_on = None
+
+    def batch_write(self, ops):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise RuntimeError("simulated outage")
+        super().batch_write(ops)
+
+
+def test_an_interrupted_cycle_deletion_leaves_consistent_balances_and_can_be_rerun():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = _FlakyMock(Path(tmp) / "db.json", logger=QueryLogger())
+        service = BudgetService(db)
+        cycle, account, _ = setup_world(service)
+        for day in range(10):
+            service.add_transaction(cycle["id"], f"2026-10-{day + 1:02d}", 100, "Save", "Savings", "Cash", target_account_id=account["id"])
+        db.calls, db.fail_on = 0, 2  # let the first batch through, fail the second
+        with pytest.raises(RuntimeError):
+            delete_cycle(db, cycle["id"], delete_transactions=True, chunk_ops=6)
+        left = service.list_transactions(cycle["id"])
+        assert db.get("income_cycles", cycle["id"]) is not None and 0 < len(left) < 10  # the cycle document goes last
+        assert _balance(db, account["id"]) == 1000 + 100 * len(left)  # balance still matches what remains
+        db.fail_on = None
+        delete_cycle(db, cycle["id"], delete_transactions=True, chunk_ops=6)
+        assert _balance(db, account["id"]) == 1000 and db.query(TRANSACTIONS) == []
+
+
+def test_ui_state_prefixes_cover_the_manage_widgets():
+    state = {"mg_ver": 2, "mg_tx_pick_0": "x", "mg_sav_bank_abc_1": "y", "keep_me": 1}
+    assert sorted(clear_ui_state(state)) == ["mg_sav_bank_abc_1", "mg_tx_pick_0", "mg_ver"]
     assert state == {"keep_me": 1}

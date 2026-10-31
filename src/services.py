@@ -45,7 +45,7 @@ PH_FINAL_WITHHOLDING_TAX = 0.20  # 20% final withholding tax on Philippine bank 
 WIPE_BATCH_SIZE = 400  # Firestore allows at most 500 writes per batch; stay safely under it
 # st.session_state key prefixes owned by the UI forms; cleared when all data is wiped.
 UI_STATE_PREFIXES = ("rec_", "topup_", "new_cycle_", "cycle_edit_", "wipe_",
-                     "split_", "imp_", "ana_", "sweep_", "tx_", "qa_")
+                     "split_", "imp_", "ana_", "sweep_", "tx_", "qa_", "mg_")
 
 # v1.1 collection. firebase_client.COLLECTIONS doubles as a whitelist inside LocalMockFirestore
 # (_load / reset / snapshot), so without this guard the mock would silently drop the new
@@ -655,6 +655,22 @@ def stretch_width_kwargs(func: Any) -> dict:
     return {}
 
 
+# ------------------------------------------------ v1.2.2: edit / delete helpers
+_SPLIT_MARK_RE = re.compile(r"(?:^|\|\s*)split ([0-9a-f]{8}) \d+/\d+\s*$")
+
+
+def split_group_id(notes: Any) -> Optional[str]:
+    """The group id of a split-payment fragment (its notes end in ``split <id> n/N``), else None."""
+    match = _SPLIT_MARK_RE.search(str(notes or ""))
+    return match.group(1) if match else None
+
+
+def cycle_base_salary(cycle: dict) -> float:
+    """Net salary before any 15th/30th top-ups."""
+    extra = sum(float(entry.get("amount") or 0) for entry in (cycle.get("top_ups") or []))
+    return round(cycle["net_salary"] - extra, 2)
+
+
 # ------------------------------------------------------------------ service
 class BudgetService:
     def __init__(self, db) -> None:
@@ -893,27 +909,143 @@ class BudgetService:
                           today: Optional[date] = None) -> dict:
         return quick_add_expense(self.db, cycle_id, amount, category, bucket, payment_channel, notes, today)
 
+    def _plan_delete_ops(self, tx: dict, cache: dict) -> list[tuple]:
+        """Ops that delete a transaction and reverse its savings/debt effect.
+
+        Tolerates a deleted target account. ``cache`` carries running balances so several deletions
+        planned into one batch accumulate on the same account.
+        """
+        ops: list[tuple] = [("delete", TRANSACTIONS, tx["id"], None)]
+        target = tx.get("target_account_id")
+        if not target or tx["bucket"] not in LINKED_BUCKETS:
+            return ops
+        collection = SAVINGS_ACCOUNTS if tx["bucket"] == "Savings" else DEBTS
+        key = (collection, target)
+        if key not in cache:
+            found = self.db.get(collection, target)
+            cache[key] = dict(found) if found is not None else None
+        doc = cache[key]
+        if doc is None:
+            return ops
+        if collection == SAVINGS_ACCOUNTS:
+            doc["current_balance"] = max(0.0, round(doc["current_balance"] - tx["amount"], 2))
+            ops.append(("update", collection, target, {"current_balance": doc["current_balance"]}))
+        else:
+            doc["remaining_balance"] = min(doc["total_amount"], round(doc["remaining_balance"] + tx["amount"], 2))
+            doc["status"] = "paid" if doc["remaining_balance"] <= 0 else "active"
+            ops.append(("update", collection, target, {
+                "remaining_balance": doc["remaining_balance"], "status": doc["status"]}))
+        return ops
+
     def delete_transaction(self, tx_id: str) -> None:
         """Delete a transaction and reverse its savings/debt balance effect."""
         tx = self.db.get(TRANSACTIONS, tx_id)
         if tx is None:
             raise ValidationError("Transaction not found.")
-        ops: list[tuple] = [("delete", TRANSACTIONS, tx_id, None)]
-        target = tx.get("target_account_id")
+        self.db.batch_write(self._plan_delete_ops(tx, {}))
 
-        if tx["bucket"] == "Savings" and target:
-            account = self.db.get(SAVINGS_ACCOUNTS, target)
-            if account:
-                ops.append(("update", SAVINGS_ACCOUNTS, target, {
-                    "current_balance": max(0.0, round(account["current_balance"] - tx["amount"], 2))}))
-        elif tx["bucket"] == "Debt" and target:
-            debt = self.db.get(DEBTS, target)
-            if debt:
-                remaining = min(debt["total_amount"], round(debt["remaining_balance"] + tx["amount"], 2))
-                ops.append(("update", DEBTS, target, {
-                    "remaining_balance": remaining,
-                    "status": "paid" if remaining <= 0 else "active"}))
+    @staticmethod
+    def _balance_impact(tx: dict) -> Optional[tuple]:
+        """``(collection, doc id, amount)`` a transaction applies to a savings account / debt."""
+        target = tx.get("target_account_id")
+        if target and tx["bucket"] == "Savings":
+            return (SAVINGS_ACCOUNTS, target, tx["amount"])
+        if target and tx["bucket"] == "Debt":
+            return (DEBTS, target, tx["amount"])
+        return None
+
+    def _plan_edit_balance_ops(self, old: dict, new: dict) -> list[tuple]:
+        """Balance updates for an edit: undo the old impact and apply the new one as a net change.
+
+        Working with the net change per account/debt means an amount edit on the same account is a
+        simple delta (no false "negative balance" halfway through). Nothing is written here; any
+        problem raises ``ValidationError`` so the caller's batch never starts.
+        """
+        before, after = self._balance_impact(old), self._balance_impact(new)
+        if before == after:
+            return []  # same effect, even if the target has since been deleted
+        net: dict[tuple, float] = {}
+        released: dict[tuple, float] = {}
+        if before:
+            net[before[:2]] = net.get(before[:2], 0.0) - before[2]
+            released[before[:2]] = before[2]
+        if after:
+            net[after[:2]] = net.get(after[:2], 0.0) + after[2]
+        ops: list[tuple] = []
+        for (collection, doc_id), delta in net.items():
+            doc = self.db.get(collection, doc_id)
+            if doc is None:
+                if after and (collection, doc_id) == after[:2]:
+                    label = "savings account" if collection == SAVINGS_ACCOUNTS else "debt"
+                    raise ValidationError(f"The selected {label} no longer exists.")
+                continue  # the old target was deleted, so there is nothing to reverse
+            delta = round(delta, 2)
+            if delta == 0:
+                continue
+            if collection == SAVINGS_ACCOUNTS:
+                balance = round(doc["current_balance"] + delta, 2)
+                if balance < 0:
+                    raise ValidationError(
+                        f"This change would leave {doc['bank_name']} below zero: it holds "
+                        f"₱{doc['current_balance']:,.2f} and the edit changes it by {delta:+,.2f}.")
+                ops.append(("update", collection, doc_id, {"current_balance": balance}))
+            else:
+                remaining = round(doc["remaining_balance"] - delta, 2)  # a larger payment lowers it
+                if remaining < 0:
+                    limit = doc["remaining_balance"] + released.get((collection, doc_id), 0.0)
+                    raise ValidationError(
+                        f"Payment exceeds the remaining balance of {doc['name']} (₱{limit:,.2f}).")
+                if remaining > doc["total_amount"]:
+                    raise ValidationError(
+                        f"This change would put {doc['name']} above its total amount "
+                        f"(₱{doc['total_amount']:,.2f}).")
+                ops.append(("update", collection, doc_id, {
+                    "remaining_balance": remaining, "status": "paid" if remaining <= 0 else "active"}))
+        return ops
+
+    def edit_transaction(self, tx_id: str, new_date: Any = None, new_amount: Any = None,
+                         new_category: Optional[str] = None, new_bucket: Optional[str] = None,
+                         new_channel: Optional[str] = None, new_target_account_id: Optional[str] = None,
+                         new_notes: Optional[str] = None) -> dict:
+        """Change a transaction and correct any savings/debt balance in the SAME atomic batch.
+
+        ``None`` keeps the current value. The old target is kept only while the bucket is unchanged;
+        a new Savings/Debt bucket needs ``new_target_account_id``. Rollover sweeps and split-payment
+        fragments cannot be edited (delete and re-log them). Returns the updated document.
+        """
+        old = self.db.get(TRANSACTIONS, tx_id)
+        if old is None:
+            raise ValidationError("Transaction not found.")
+        if is_sweep_transaction(old):
+            raise ValidationError("A Rollover sweep can't be edited. Delete it and sweep again.")
+        if split_group_id(old.get("notes")):
+            raise ValidationError("This transaction is one part of a split payment, so it can't be edited "
+                                  "on its own. Delete it and log it again.")
+        bucket = old["bucket"] if new_bucket is None else new_bucket
+        keep_target = new_target_account_id is None and bucket == old["bucket"]
+        target = old.get("target_account_id") if keep_target else new_target_account_id
+        updated = Transaction(
+            id=tx_id, cycle_id=old["cycle_id"],
+            date=old["date"] if new_date is None else new_date,
+            amount=old["amount"] if new_amount is None else new_amount,
+            category=old["category"] if new_category is None else new_category,
+            bucket=bucket,
+            payment_channel=old["payment_channel"] if new_channel is None else new_channel,
+            target_account_id=target if bucket in LINKED_BUCKETS else None,
+            notes=old.get("notes", "") if new_notes is None else new_notes,
+            created_at=old.get("created_at", ""))
+        if updated.bucket == "Savings" and updated.category.lower() == SWEEP_CATEGORY.lower():
+            raise ValidationError(f"'{SWEEP_CATEGORY}' is reserved for sweeps. Choose another category.")
+        if updated.bucket in LINKED_BUCKETS and not updated.target_account_id:
+            label = "savings account" if updated.bucket == "Savings" else "debt"
+            raise ValidationError(f"Select a {label} for a {updated.bucket} transaction.")
+        new_doc = updated.to_dict()
+        if all(old.get(key) == value for key, value in new_doc.items()):
+            return old  # nothing changed: no writes
+        ops: list[tuple] = [("set", TRANSACTIONS, tx_id, new_doc)]
+        ops += self._plan_edit_balance_ops(old, new_doc)
         self.db.batch_write(ops)
+        return new_doc
 
     def list_transactions(self, cycle_id: Optional[str] = None, bucket: Optional[str] = None,
                           payment_channel: Optional[str] = None) -> list[dict]:
@@ -950,6 +1082,31 @@ class BudgetService:
 
     def wipe_all_data(self) -> dict[str, int]:
         return wipe_all_data(self.db)
+
+    # ---- v1.2.2: edit / delete (module-level functions below) ----------
+    def edit_savings_account(self, account_id: str, *args: Any, **kwargs: Any) -> dict:
+        return edit_savings_account(self.db, account_id, *args, **kwargs)
+
+    def delete_savings_account(self, account_id: str) -> dict[str, int]:
+        return delete_savings_account(self.db, account_id)
+
+    def edit_debt(self, debt_id: str, *args: Any, **kwargs: Any) -> dict:
+        return edit_debt(self.db, debt_id, *args, **kwargs)
+
+    def delete_debt(self, debt_id: str) -> dict[str, int]:
+        return delete_debt(self.db, debt_id)
+
+    def edit_recurring_template(self, template_id: str, *args: Any, **kwargs: Any) -> dict:
+        return edit_recurring_template(self.db, template_id, *args, **kwargs)
+
+    def edit_cycle(self, cycle_id: str, *args: Any, **kwargs: Any) -> dict:
+        return edit_cycle(self.db, cycle_id, *args, **kwargs)
+
+    def delete_cycle(self, cycle_id: str, *args: Any, **kwargs: Any) -> dict:
+        return delete_cycle(self.db, cycle_id, *args, **kwargs)
+
+    def account_references(self, doc_id: str) -> dict[str, int]:
+        return account_references(self.db, doc_id)
 
     # ---- sample data --------------------------------------------------
     def seed_sample_data(self, today: Optional[date] = None) -> dict[str, int]:
@@ -1203,3 +1360,191 @@ def quick_add_expense(db, cycle_id: str, amount: float, category: str, bucket: s
         raise ValidationError(f"Quick add is for {' and '.join(SPEND_BUCKETS)} only.")
     when = _to_date(today) if today else date.today()
     return log_transaction(db, cycle_id, when, amount, category, bucket, payment_channel, notes=notes)
+
+
+# ------------------------------------------------- v1.2.2 module-level functions
+def _present(**fields: Any) -> dict:
+    """The keyword arguments that were actually given (``None`` means "keep the current value")."""
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def edit_transaction(db, tx_id: str, new_date: Any = None, new_amount: Any = None,
+                     new_category: Optional[str] = None, new_bucket: Optional[str] = None,
+                     new_channel: Optional[str] = None, new_target_account_id: Optional[str] = None,
+                     new_notes: Optional[str] = None) -> dict:
+    """Edit a transaction; see :meth:`BudgetService.edit_transaction` (atomic balance correction)."""
+    return BudgetService(db).edit_transaction(tx_id, new_date, new_amount, new_category, new_bucket,
+                                              new_channel, new_target_account_id, new_notes)
+
+
+def account_references(db, doc_id: str) -> dict[str, int]:
+    """How many transactions and recurring bills point at a savings account / debt id."""
+    flt = [("target_account_id", "==", doc_id)]
+    return {"transactions": len(db.query(TRANSACTIONS, flt)),
+            "recurring_templates": len(db.query(RECURRING_TEMPLATES, flt))}
+
+
+def edit_savings_account(db, account_id: str, new_bank_name: Optional[str] = None,
+                         new_goal_name: Optional[str] = None, new_balance: Any = None,
+                         new_interest_rate: Any = None) -> dict:
+    """Edit a savings account. A new balance is a manual correction, not a transaction."""
+    account = db.get(SAVINGS_ACCOUNTS, account_id)
+    if account is None:
+        raise ValidationError("Savings account not found.")
+    checked = SavingsAccount.from_dict({**account, **_present(
+        bank_name=new_bank_name, goal_name=new_goal_name, current_balance=new_balance,
+        interest_rate=new_interest_rate)}).to_dict()
+    changed = {key: value for key, value in checked.items() if account.get(key) != value}
+    if changed:
+        db.update(SAVINGS_ACCOUNTS, account_id, changed)
+    return {**account, **changed}
+
+
+def delete_savings_account(db, account_id: str) -> dict[str, int]:
+    """Delete a savings account. Transactions and recurring bills that pointed at it are kept (the
+    UI shows them as "(deleted)"); returns how many there were."""
+    if db.get(SAVINGS_ACCOUNTS, account_id) is None:
+        raise ValidationError("Savings account not found.")
+    references = account_references(db, account_id)
+    db.delete(SAVINGS_ACCOUNTS, account_id)
+    return references
+
+
+def edit_debt(db, debt_id: str, new_name: Optional[str] = None, new_total_amount: Any = None,
+              new_remaining_balance: Any = None, new_minimum_payment: Any = None,
+              new_due_date: Any = None) -> dict:
+    """Edit a debt. The status follows the remaining balance (paid at zero)."""
+    debt = db.get(DEBTS, debt_id)
+    if debt is None:
+        raise ValidationError("Debt not found.")
+    due = None if new_due_date is None else _to_date(new_due_date).isoformat()
+    checked = Debt.from_dict({**debt, **_present(
+        name=new_name, total_amount=new_total_amount, remaining_balance=new_remaining_balance,
+        minimum_payment=new_minimum_payment, due_date=due)}).to_dict()
+    changed = {key: value for key, value in checked.items() if debt.get(key) != value}
+    if changed:
+        db.update(DEBTS, debt_id, changed)
+    return {**debt, **changed}
+
+
+def delete_debt(db, debt_id: str) -> dict[str, int]:
+    """Delete a debt; transactions and recurring bills that pointed at it are kept (see above)."""
+    if db.get(DEBTS, debt_id) is None:
+        raise ValidationError("Debt not found.")
+    references = account_references(db, debt_id)
+    db.delete(DEBTS, debt_id)
+    return references
+
+
+def edit_recurring_template(db, template_id: str, new_name: Optional[str] = None,
+                            new_amount: Any = None, new_category: Optional[str] = None,
+                            new_bucket: Optional[str] = None, new_channel: Optional[str] = None,
+                            new_target_account_id: Optional[str] = None, new_due_day: Any = None) -> dict:
+    """Edit a recurring bill. The old target is kept only while the bucket is unchanged."""
+    template = db.get(RECURRING_TEMPLATES, template_id)
+    if template is None:
+        raise ValidationError("Recurring template not found.")
+    bucket = template["bucket"] if new_bucket is None else new_bucket
+    keep_target = new_target_account_id is None and bucket == template["bucket"]
+    target = template.get("target_account_id") if keep_target else new_target_account_id
+    doc = RecurringTemplate(
+        id=template_id,
+        name=template["name"] if new_name is None else new_name,
+        amount=template["amount"] if new_amount is None else new_amount,
+        category=template["category"] if new_category is None else new_category,
+        bucket=bucket,
+        payment_channel=template["payment_channel"] if new_channel is None else new_channel,
+        target_account_id=target,
+        due_day=template["due_day"] if new_due_day is None else new_due_day).to_dict()
+    if (doc["bucket"], doc["target_account_id"]) != (template["bucket"], template.get("target_account_id")):
+        if doc["bucket"] == "Savings" and db.get(SAVINGS_ACCOUNTS, doc["target_account_id"]) is None:
+            raise ValidationError("The selected savings account no longer exists.")
+        if doc["bucket"] == "Debt" and db.get(DEBTS, doc["target_account_id"]) is None:
+            raise ValidationError("The selected debt no longer exists.")
+    changed = {key: value for key, value in doc.items() if template.get(key) != value}
+    if changed:
+        db.update(RECURRING_TEMPLATES, template_id, changed)
+    return doc
+
+
+def edit_cycle(db, cycle_id: str, new_name: Optional[str] = None, new_base_net_salary: Any = None) -> dict:
+    """Rename a cycle and/or change its base net salary (the amount before top-ups).
+
+    The new total is the new base plus the recorded top-ups; the 50/30/20 caps are re-split from it
+    (the 20% bucket absorbs rounding) and each top-up's ``net_salary_after`` is rebuilt.
+    """
+    cycle = db.get(INCOME_CYCLES, cycle_id)
+    if cycle is None:
+        raise ValidationError("Pay cycle not found.")
+    updates: dict[str, Any] = {}
+    if new_name is not None:
+        updates["cycle_name"] = new_name
+    if new_base_net_salary is not None:
+        try:
+            base = round(float(new_base_net_salary), 2)
+        except (TypeError, ValueError):
+            raise ValidationError("Base net salary must be a number.") from None
+        if not math.isfinite(base) or base <= 0:
+            raise ValidationError("Base net salary must be greater than 0.")
+        top_ups = list(cycle.get("top_ups") or [])
+        running, rebuilt = base, []
+        for entry in top_ups:
+            running = round(running + float(entry.get("amount") or 0), 2)
+            rebuilt.append({**entry, "net_salary_after": running})
+        updates.update(calculate_split(running))
+        updates["net_salary"] = running
+        updates["top_ups"] = rebuilt
+    checked = IncomeCycle.from_dict({**cycle, **updates}).to_dict()
+    changed = {key: checked[key] for key in updates if cycle.get(key) != checked[key]}
+    if changed:
+        db.update(INCOME_CYCLES, cycle_id, changed)
+    return {**cycle, **changed}
+
+
+def _commit_groups(db, groups: list[list[tuple]], chunk_ops: int, tail: Optional[list[tuple]] = None) -> int:
+    """Commit op groups in batches of at most ``chunk_ops`` ops without splitting a group.
+    ``tail`` goes into the last batch. Returns the number of batches."""
+    batches, chunk = 0, []
+    for group in groups:
+        if chunk and len(chunk) + len(group) > chunk_ops:
+            db.batch_write(chunk)
+            batches, chunk = batches + 1, []
+        chunk.extend(group)
+    chunk.extend(tail or [])
+    if chunk:
+        db.batch_write(chunk)
+        batches += 1
+    return batches
+
+
+def delete_cycle(db, cycle_id: str, delete_transactions: bool = False,
+                 chunk_ops: int = MAX_BATCH_OPS) -> dict:
+    """Delete a pay cycle.
+
+    A cycle that has transactions is only deleted together with them (``delete_transactions=True``),
+    reversing their savings/debt effects exactly like deleting them one by one. Deletions are
+    batched with each transaction kept with its balance update, and the cycle document goes last, so
+    an interrupted run leaves a consistent database you can simply run again. If the active cycle is
+    deleted, the most recent remaining cycle becomes active so the app is never left without one.
+    """
+    cycle = db.get(INCOME_CYCLES, cycle_id)
+    if cycle is None:
+        raise ValidationError("Pay cycle not found.")
+    txs = db.query(TRANSACTIONS, [("cycle_id", "==", cycle_id)])
+    if txs and not delete_transactions:
+        raise ValidationError(f"This cycle has {len(txs)} transaction(s). Confirm deleting them too "
+                              "(their savings and debt effects are reversed).")
+    others = [c for c in db.query(INCOME_CYCLES) if c["id"] != cycle_id]
+    promote = None
+    if cycle.get("is_active") and others and not any(c.get("is_active") for c in others):
+        promote = max(others, key=lambda c: c["start_date"])
+    service = BudgetService(db)
+    cache: dict = {}
+    groups = [service._plan_delete_ops(tx, cache)
+              for tx in sorted(txs, key=lambda t: (t["date"], t.get("created_at", "")))]
+    tail: list[tuple] = [("delete", INCOME_CYCLES, cycle_id, None)]
+    if promote:
+        tail.append(("update", INCOME_CYCLES, promote["id"], {"is_active": True}))
+    batches = _commit_groups(db, groups, chunk_ops, tail)
+    return {"deleted_transactions": len(txs), "activated_cycle_id": promote["id"] if promote else None,
+            "batches": batches}

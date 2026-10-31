@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 
 from src.firebase_client import QUERY_LOG, get_database
-from src.models import BUCKETS, LOG_BUCKETS, PAYMENT_CHANNELS, SPEND_BUCKETS, ValidationError
+from src.models import BUCKETS, LINKED_BUCKETS, LOG_BUCKETS, PAYMENT_CHANNELS, SPEND_BUCKETS, ValidationError
 from src.services import (
     ALL_COLLECTIONS,
     FREQUENCIES,
@@ -22,17 +22,20 @@ from src.services import (
     calculate_split,
     clear_ui_state,
     collect_tags,
+    cycle_base_salary,
     daily_spend_series,
     debt_progress,
     default_end_date,
     due_label,
     filter_by_tags,
     find_possible_duplicates,
+    is_sweep_transaction,
     next_due_date,
     pacing_summary,
     parse_bank_csv,
     portfolio_interest_projection,
     quick_add_expense,
+    split_group_id,
     stretch_width_kwargs,
     summarize_cycle,
     tag_totals,
@@ -102,6 +105,24 @@ if "_flash" in st.session_state:
     st.toast(st.session_state.pop("_flash"))
 for _level, _message in st.session_state.pop("_notices", []):
     getattr(st, _level)(_message)
+
+
+def _ver() -> int:
+    """Counter baked into the manage-widget keys; bumped after every save or delete so the forms
+    reload fresh values from the database instead of showing stale ones."""
+    return st.session_state.get("mg_ver", 0)
+
+
+def _bump() -> None:
+    st.session_state["mg_ver"] = _ver() + 1
+
+
+def _pick(label: str, options: dict[str, str], key: str) -> str:
+    """Selectbox over ``{id: label}`` that survives the previously chosen item disappearing."""
+    full_key = f"{key}_{_ver()}"
+    if st.session_state.get(full_key) not in options:
+        st.session_state.pop(full_key, None)
+    return st.selectbox(label, list(options), format_func=options.get, key=full_key)
 
 
 WIPE_PHRASE = "WIPE"
@@ -273,13 +294,16 @@ QUICK_ADD_PRESETS = ("Commute/Fare", "Lunch", "Coffee", "Groceries", "Mobile loa
 def render_cycle_actions(cycle: dict) -> None:
     """Top-up, date editing and sweeping tucked into one expander so they stay out of the daily view."""
     with st.expander("⚙️ Cycle Actions & Settings"):
-        top_up_tab, dates_tab, sweep_tab = st.tabs(["💵 Top-up salary", "📅 Edit dates", "🧹 Sweep unspent"])
+        top_up_tab, dates_tab, sweep_tab, manage_tab = st.tabs(
+            ["💵 Top-up salary", "📅 Edit dates", "🧹 Sweep unspent", "🛠️ Manage cycle"])
         with top_up_tab:
             render_top_up_form(cycle)
         with dates_tab:
             render_edit_cycle_dates(cycle)
         with sweep_tab:
             render_sweep(cycle)
+        with manage_tab:
+            render_manage_cycle(cycle)
 
 
 def render_upcoming_bills(transactions: list[dict]) -> None:
@@ -377,6 +401,257 @@ def page_dashboard() -> None:
             if st.button("Make active", **BTN) and choice != cycle["id"]:
                 run_action(lambda: service.activate_cycle(choice), "Cycle switched.")
     render_new_cycle_form(expanded=False)
+
+
+# ------------------------------------------------------ edit / delete (v1.2.2)
+def _target_picker(bucket: str, current_bucket: str, current_id, targets: dict[str, str], key: str):
+    """Savings/Debt target selectbox for an edit form. Returns the chosen id, or None to keep the
+    current target (the service keeps it only while the bucket is unchanged)."""
+    labels = [label for label in targets if label.startswith(f"{bucket} ·")]
+    original = current_id if bucket == current_bucket else None
+    current = next((label for label, doc_id in targets.items() if doc_id == original), None)
+    if original and current is None:
+        st.warning("The account this points to was deleted. Pick another one, or save without "
+                   "choosing to change only the other fields.")
+    if not labels:
+        st.warning(f"Add a {'savings account' if bucket == 'Savings' else 'debt'} first.")
+        return None
+    choice = st.selectbox(f"{bucket} target", labels, key=key, placeholder="Choose one...",
+                          index=labels.index(current) if current in labels else None)
+    return resolve_target(choice, bucket, targets)
+
+
+def _render_transaction_form(tx: dict, accounts: list[dict], ver: int) -> None:
+    targets = target_options(accounts, service.list_debts())  # all debts, so a paid-off target is selectable
+    k = lambda name: f"mg_tx_{name}_{tx['id']}_{ver}"  # noqa: E731
+    bucket = st.radio("Bucket", LOG_BUCKETS, index=LOG_BUCKETS.index(tx["bucket"]), horizontal=True,
+                      key=k("bucket"))
+    c1, c2 = st.columns(2)
+    when = c1.date_input("Date", value=date.fromisoformat(tx["date"]), key=k("date"))
+    amount = c2.number_input("Amount (₱)", min_value=0.0, value=float(tx["amount"]), step=50.0,
+                             format="%.2f", key=k("amount"))
+    category = c1.text_input("Category", value=tx["category"], key=k("category"))
+    channels = list(PAYMENT_CHANNELS)
+    if tx["payment_channel"] not in channels:
+        channels.append(tx["payment_channel"])
+    channel = c2.selectbox("Payment channel", channels, index=channels.index(tx["payment_channel"]),
+                           key=k("channel"))
+    notes = st.text_input("Notes", value=tx.get("notes", ""), key=k("notes"))
+    target = None
+    if bucket in LINKED_BUCKETS:
+        target = _target_picker(bucket, tx["bucket"], tx.get("target_account_id"), targets, k("target"))
+    if bucket in LINKED_BUCKETS or tx["bucket"] in LINKED_BUCKETS:
+        st.caption("Savings and debt balances are corrected automatically, in the same save.")
+
+    def save() -> None:
+        service.edit_transaction(tx["id"], new_date=when, new_amount=amount, new_category=category,
+                                 new_bucket=bucket, new_channel=channel, new_target_account_id=target,
+                                 new_notes=notes)
+        _bump()
+
+    if st.button("💾 Save Changes", type="primary", key=k("save"), **BTN):
+        run_action(save, "Transaction updated.")
+
+
+def render_edit_transaction(cycle: dict, accounts: list[dict]) -> None:
+    with st.expander("✏️ Edit or Delete a Transaction"):
+        txs = service.list_transactions(cycle_id=cycle["id"])
+        if not txs:
+            st.caption("No transactions in this cycle yet.")
+            return
+        tx_id = _pick("Transaction", {t["id"]: f"{t['date']} · {t['bucket']} · {t['category']} · {peso(t['amount'])}"
+                                      for t in txs}, "mg_tx_pick")
+        tx = next(t for t in txs if t["id"] == tx_id)
+        ver = _ver()
+        if is_sweep_transaction(tx):
+            st.warning("A Rollover sweep can't be edited. Delete it and sweep again from "
+                       "Cycle Actions & Settings on the Dashboard.")
+        elif split_group_id(tx.get("notes")):
+            st.warning("This is one part of a split payment, so it can't be edited on its own. "
+                       "Delete it and log it again with the Split transaction toggle.")
+        else:
+            _render_transaction_form(tx, accounts, ver)
+        st.divider()
+        confirmed = st.checkbox("Yes, delete this transaction (savings and debt balances are reversed)",
+                                key=f"mg_tx_confirm_{tx_id}_{ver}")
+
+        def remove() -> None:
+            service.delete_transaction(tx_id)
+            _bump()
+
+        if st.button("🗑️ Delete Transaction", key=f"mg_tx_delete_{tx_id}_{ver}", disabled=not confirmed, **BTN):
+            run_action(remove, "Transaction deleted.")
+
+
+def _reference_warning(doc_id: str, what: str) -> None:
+    refs = service.account_references(doc_id)
+    if refs["transactions"] or refs["recurring_templates"]:
+        st.warning(f"{refs['transactions']} transaction(s) and {refs['recurring_templates']} recurring bill(s) "
+                   f"point at this {what}. They are kept and will show as '(deleted)'.")
+
+
+def render_manage_savings(accounts: list[dict]) -> None:
+    with st.expander("✏️ Manage Savings Accounts"):
+        if not accounts:
+            st.caption("No accounts to manage yet.")
+            return
+        account_id = _pick("Account", {a["id"]: f"{a['bank_name']} - {a['goal_name'] or 'Savings'} "
+                                                f"({peso(a['current_balance'])})" for a in accounts}, "mg_sav_pick")
+        account = next(a for a in accounts if a["id"] == account_id)
+        ver = _ver()
+        k = lambda name: f"mg_sav_{name}_{account_id}_{ver}"  # noqa: E731
+        c1, c2 = st.columns(2)
+        bank = c1.text_input("Bank / wallet", value=account["bank_name"], key=k("bank"))
+        goal = c2.text_input("Goal name", value=account["goal_name"], key=k("goal"))
+        balance = c1.number_input("Balance (₱)", min_value=0.0, value=float(account["current_balance"]),
+                                  step=100.0, format="%.2f", key=k("balance"))
+        rate = c2.number_input("Interest rate (% p.a.)", min_value=0.0, max_value=100.0,
+                               value=float(account["interest_rate"]), step=0.25, format="%.2f", key=k("rate"))
+        st.caption("Changing the balance here is a manual correction (for example to match your bank app). "
+                   "It does not create a transaction.")
+
+        def save() -> None:
+            service.edit_savings_account(account_id, new_bank_name=bank, new_goal_name=goal,
+                                         new_balance=balance, new_interest_rate=rate)
+            _bump()
+
+        if st.button("💾 Save Changes", type="primary", key=k("save"), **BTN):
+            run_action(save, f"Updated {bank.strip() or account['bank_name']}.")
+        st.divider()
+        _reference_warning(account_id, "account")
+        confirmed = st.checkbox(f"Yes, delete {account['bank_name']}", key=k("confirm"))
+
+        def remove() -> None:
+            service.delete_savings_account(account_id)
+            _bump()
+
+        if st.button("🗑️ Delete Account", key=k("delete"), disabled=not confirmed, **BTN):
+            run_action(remove, f"Deleted {account['bank_name']}.")
+
+
+def render_manage_debts(debts: list[dict]) -> None:
+    with st.expander("✏️ Manage Debts"):
+        if not debts:
+            st.caption("No debts to manage yet.")
+            return
+        debt_id = _pick("Debt", {d["id"]: f"{d['name']} ({peso(d['remaining_balance'])} left"
+                                          f"{', paid off' if d['status'] == 'paid' else ''})" for d in debts},
+                        "mg_debt_pick")
+        debt = next(d for d in debts if d["id"] == debt_id)
+        ver = _ver()
+        k = lambda name: f"mg_debt_{name}_{debt_id}_{ver}"  # noqa: E731
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Debt name", value=debt["name"], key=k("name"))
+        due = c2.date_input("Next due date", value=date.fromisoformat(debt["due_date"]), key=k("due"))
+        total = c1.number_input("Total amount (₱)", min_value=0.0, value=float(debt["total_amount"]),
+                                step=500.0, format="%.2f", key=k("total"))
+        remaining = c2.number_input("Remaining balance (₱)", min_value=0.0,
+                                    value=float(debt["remaining_balance"]), step=500.0, format="%.2f",
+                                    key=k("remaining"))
+        minimum = c1.number_input("Minimum payment (₱)", min_value=0.0, value=float(debt["minimum_payment"]),
+                                  step=100.0, format="%.2f", key=k("minimum"))
+        st.caption("The remaining balance is a manual correction; it does not create a transaction. "
+                   "A debt is marked paid when the remaining balance is 0.")
+
+        def save() -> None:
+            service.edit_debt(debt_id, new_name=name, new_total_amount=total, new_remaining_balance=remaining,
+                              new_minimum_payment=minimum, new_due_date=due)
+            _bump()
+
+        if st.button("💾 Save Changes", type="primary", key=k("save"), **BTN):
+            run_action(save, f"Updated {name.strip() or debt['name']}.")
+        st.divider()
+        _reference_warning(debt_id, "debt")
+        confirmed = st.checkbox(f"Yes, delete {debt['name']}", key=k("confirm"))
+
+        def remove() -> None:
+            service.delete_debt(debt_id)
+            _bump()
+
+        if st.button("🗑️ Delete Debt", key=k("delete"), disabled=not confirmed, **BTN):
+            run_action(remove, f"Deleted {debt['name']}.")
+
+
+def render_edit_recurring(templates: list[dict], accounts: list[dict], all_debts: list[dict]) -> None:
+    with st.expander("✏️ Edit a Recurring Bill"):
+        if not templates:
+            st.caption("No recurring bills to edit yet.")
+            return
+        template_id = _pick("Bill", {t["id"]: f"{t['name']} · {peso(t['amount'])} · due day {t['due_day']}"
+                                     for t in templates}, "mg_rec_pick")
+        tpl = next(t for t in templates if t["id"] == template_id)
+        ver = _ver()
+        k = lambda name: f"mg_rec_{name}_{template_id}_{ver}"  # noqa: E731
+        bucket = st.radio("Bucket", LOG_BUCKETS, index=LOG_BUCKETS.index(tpl["bucket"]), horizontal=True,
+                          key=k("bucket"))
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Bill name", value=tpl["name"], key=k("name"))
+        amount = c2.number_input("Amount (₱)", min_value=0.0, value=float(tpl["amount"]), step=50.0,
+                                 format="%.2f", key=k("amount"))
+        category = c1.text_input("Category", value=tpl["category"], key=k("category"))
+        channels = list(PAYMENT_CHANNELS)
+        if tpl["payment_channel"] not in channels:
+            channels.append(tpl["payment_channel"])
+        channel = c2.selectbox("Payment channel", channels, index=channels.index(tpl["payment_channel"]),
+                               key=k("channel"))
+        due_day = c1.number_input("Due day of month", min_value=1, max_value=31, value=int(tpl["due_day"]),
+                                  step=1, key=k("due"))
+        target = None
+        if bucket in LINKED_BUCKETS:
+            target = _target_picker(bucket, tpl["bucket"], tpl.get("target_account_id"),
+                                    target_options(accounts, all_debts), k("target"))
+
+        def save() -> None:
+            service.edit_recurring_template(template_id, new_name=name, new_amount=amount, new_category=category,
+                                            new_bucket=bucket, new_channel=channel, new_target_account_id=target,
+                                            new_due_day=due_day)
+            _bump()
+
+        if st.button("💾 Save Changes", type="primary", key=k("save"), **BTN):
+            run_action(save, f"Updated {name.strip() or tpl['name']}.")
+        st.caption("Use the 🗑️ button next to a bill in the list above to delete it.")
+
+
+def render_manage_cycle(cycle: dict) -> None:
+    ver = _ver()
+    k = lambda name: f"mg_cycle_{name}_{cycle['id']}_{ver}"  # noqa: E731
+    top_ups = cycle.get("top_ups") or []
+    extra = round(sum(float(t.get("amount") or 0) for t in top_ups), 2)
+    c1, c2 = st.columns(2)
+    name = c1.text_input("Cycle name", value=cycle["cycle_name"], key=k("name"))
+    base = c2.number_input("Base net salary (₱)", min_value=0.0, value=float(cycle_base_salary(cycle)),
+                           step=500.0, format="%.2f", key=k("base"),
+                           help="Your salary before any 15th/30th top-ups.")
+    if top_ups:
+        st.caption(f"Plus {len(top_ups)} top-up(s) totalling {peso(extra)}.")
+    if base > 0:
+        caps = calculate_split(round(base + extra, 2))
+        st.caption(f"Resulting net salary {peso(base + extra)} → Needs {peso(caps['needs_cap'])} · "
+                   f"Wants {peso(caps['wants_cap'])} · Savings & Debt {peso(caps['savings_debt_cap'])}")
+
+    def save() -> None:
+        service.edit_cycle(cycle["id"], new_name=name, new_base_net_salary=base)
+        _bump()
+
+    if st.button("💾 Save Changes", type="primary", key=k("save"), **BTN):
+        run_action(save, "Cycle updated.")
+    st.divider()
+    st.markdown("**Delete this cycle**")
+    count = len(service.list_transactions(cycle_id=cycle["id"]))
+    also = True
+    if count:
+        st.warning(f"This cycle has {count} transaction(s). Deleting it also deletes them and reverses their "
+                   "savings and debt effects. If it is the active cycle, the most recent remaining cycle "
+                   "becomes active.")
+        also = st.checkbox(f"Also delete its {count} transaction(s)", key=k("alsotx"))
+    confirmed = st.checkbox("Yes, delete this cycle", key=k("confirm"))
+
+    def remove() -> None:
+        service.delete_cycle(cycle["id"], delete_transactions=bool(count))
+        _bump()
+
+    if st.button("🗑️ Delete Cycle", key=k("delete"), disabled=not (confirmed and also), **BTN):
+        run_action(remove, f"Deleted {cycle['cycle_name']}" + (f" and its {count} transaction(s)." if count else "."))
 
 
 # ------------------------------------------------------------ transactions
@@ -601,20 +876,15 @@ def page_transactions() -> None:
            and (not channel_filter or t["payment_channel"] in channel_filter)]
     if not txs:
         st.caption("No transactions match.")
-        return
-    names = {a["id"]: a["bank_name"] for a in accounts}
-    names.update({d["id"]: d["name"] for d in service.list_debts()})
-    df = pd.DataFrame(txs)
-    df["target"] = df["target_account_id"].map(lambda i: names.get(i, "") if i else "")
-    st.dataframe(df[["date", "bucket", "category", "amount", "payment_channel", "target", "notes"]],
-                 hide_index=True, **DF)
-    st.caption(f"{len(txs)} transaction(s) · total {peso(sum(t['amount'] for t in txs))}")
-
-    st.markdown("**Delete a transaction** (savings and debt balances are reversed automatically)")
-    labels = {t["id"]: f"{t['date']} · {t['bucket']} · {t['category']} · {peso(t['amount'])}" for t in txs}
-    victim = st.selectbox("Transaction", list(labels), format_func=labels.get, label_visibility="collapsed")
-    if st.button("🗑️ Delete selected", **BTN):
-        run_action(lambda: service.delete_transaction(victim), "Transaction deleted.")
+    else:
+        names = {a["id"]: a["bank_name"] for a in accounts}
+        names.update({d["id"]: d["name"] for d in service.list_debts()})
+        df = pd.DataFrame(txs)
+        df["target"] = df["target_account_id"].map(lambda i: names.get(i, "(deleted)") if i else "")
+        st.dataframe(df[["date", "bucket", "category", "amount", "payment_channel", "target", "notes"]],
+                     hide_index=True, **DF)
+        st.caption(f"{len(txs)} transaction(s) · total {peso(sum(t['amount'] for t in txs))}")
+    render_edit_transaction(cycle, accounts)
 
 
 # --------------------------------------------------------- recurring bills
@@ -668,7 +938,7 @@ def page_recurring() -> None:
         c1.markdown(f"**{tpl['name']}**  ·  {peso(tpl['amount'])}  ·  {tpl['bucket']} / {tpl['category']}  ·  "
                     f"via {tpl['payment_channel']}")
         when = "today" if days == 0 else f"in {days} day(s)"
-        target = f" · → {names.get(tpl.get('target_account_id'), 'unknown target')}" if tpl.get("target_account_id") else ""
+        target = f" · → {names.get(tpl.get('target_account_id'), '(deleted)')}" if tpl.get("target_account_id") else ""
         c1.caption(f"{'🔔 ' if days <= 7 else ''}Due day {tpl['due_day']} · next {due:%b %d} ({when}){target}")
         if c2.button("🗑️", key=f"rec_del_{tpl['id']}", help="Delete this template", **BTN):
             run_action(lambda tid=tpl["id"]: service.delete_recurring_template(tid), f"Deleted {tpl['name']}.")
@@ -709,6 +979,7 @@ def page_recurring() -> None:
         run_action(lambda: service.create_recurring_template(name, amount, category, bucket, channel,
                                                              due_day, target),
                    f"Added recurring bill {name}.")
+    render_edit_recurring(templates, accounts, all_debts)
 
 
 # --------------------------------------------------------------- analytics
@@ -836,6 +1107,8 @@ def page_savings() -> None:
             run_action(lambda: service.add_savings_account(bank, goal, balance, rate),
                        f"Added {bank}.")
 
+    render_manage_savings(accounts)
+
 
 # ------------------------------------------------------------------- debts
 def page_debts() -> None:
@@ -870,6 +1143,8 @@ def page_debts() -> None:
         if st.form_submit_button("Add debt", type="primary", **FORM_BTN):
             run_action(lambda: service.add_debt(name, total, minimum, due, remaining_balance=remaining),
                        f"Added {name}.")
+
+    render_manage_debts(debts)
 
 
 # --------------------------------------------------------------- developer
